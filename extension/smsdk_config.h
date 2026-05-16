@@ -64,7 +64,9 @@
 //#define SMEXT_ENABLE_DBMANAGER
 #define SMEXT_ENABLE_GAMECONF
 //#define SMEXT_ENABLE_MEMUTILS
-#define SMEXT_ENABLE_GAMEHELPERS
+// IGameHelpers is not guaranteed on older SourceMod builds.
+// Avoid a hard dependency so the extension can still load there.
+//#define SMEXT_ENABLE_GAMEHELPERS
 //#define SMEXT_ENABLE_TIMERSYS
 #define SMEXT_ENABLE_THREADER
 #define SMEXT_ENABLE_LIBSYS

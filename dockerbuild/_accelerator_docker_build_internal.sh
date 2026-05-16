@@ -38,11 +38,11 @@ bootstrapPkgs()
         lib32stdc++-10-dev lib32z1-dev libc6-dev-i386 linux-libc-dev:i386 \
         libzstd-dev libzstd-dev:i386 zlib1g-dev zlib1g-dev:i386
 
-	# force clang to be our compiler no matter what, hopefully
+        # force clang to be our compiler no matter what, hopefully
         update-alternatives --install /usr/bin/cc cc /usr/bin/clang 100
         update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++ 100
 
-	# this is just for logging
+        # this is just for logging
         cc --version || true
         c++ --version || true
 }
@@ -63,6 +63,7 @@ bootstrapAM()
     mkdir -p ${amTempLocation}                  || exit 1
     pushd ${amTempLocation}                     || exit 1
         git clone -b ${smBranch} --recursive --depth 1 https://github.com/alliedmodders/sourcemod sourcemod             || exit 1
+        sed -i 's/^#define SMINTERFACE_GAMEHELPERS_VERSION[[:space:]]\+13$/#define SMINTERFACE_GAMEHELPERS_VERSION\t\t1/' sourcemod/public/IGameHelpers.h
         git clone                --recursive --depth 1 https://github.com/alliedmodders/ambuild ambuild                 || exit 1
         pip install ./ambuild
 

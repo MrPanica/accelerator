@@ -3,13 +3,13 @@ From: Asher Baker <asherkin@limetech.io>
 Date: Sun, 13 Jan 2019 12:35:05 +0000
 Subject: [PATCH 2/5] Write FUNC records instead of PUBLIC for ELF symbols with
  sizes
- ---
+
+---
  src/common/linux/elf_symbols_to_module.cc | 17 +++++++++++++----
  1 file changed, 13 insertions(+), 4 deletions(-)
 
-
 diff --git a/src/common/linux/elf_symbols_to_module.cc b/src/common/linux/elf_symbols_to_module.cc
-index 70d50f89..f21460bf 100644
+index 70d50f89..07b4c0a9 100644
 --- a/src/common/linux/elf_symbols_to_module.cc
 +++ b/src/common/linux/elf_symbols_to_module.cc
 @@ -164,19 +164,28 @@ bool ELFSymbolsToModule(const uint8_t* symtab_section,
@@ -38,7 +38,7 @@ index 70d50f89..f21460bf 100644
 +        module->AddFunction(fun);
 +      }
 +#else
-+      Module::Extern *ext = new Module::Extern(iterator->value);
++      auto ext = std::make_unique<Module::Extern>(iterator->value);
 +      ext->name = name;
        module->AddExtern(std::move(ext));
 +#endif

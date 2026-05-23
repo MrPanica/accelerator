@@ -48,7 +48,7 @@ public void OnPluginStart()
 {
 	RegAdminCmd("sm_dump_list", Command_DumpList, ADMFLAG_RCON, "Lists locally pending Accelerator dump files.");
 	RegAdminCmd("sm_proc_dump", Command_ProcessDump, ADMFLAG_RCON, "Processes a local Accelerator dump and writes the result to a file.");
-	RegAdminCmd("sm_proc_stack_dump", Command_ProcessStackDump, ADMFLAG_RCON, "Prints the short crashed-thread stack trace for a local Accelerator dump.");
+	RegAdminCmd("sm_proc_stack_dump", Command_ProcessStackDump, ADMFLAG_RCON, "Prints the full trace and metadata for a local Accelerator dump, without console history.");
 	RegAdminCmd("sm_dump_crash_test", Command_CrashTest, ADMFLAG_RCON, "Intentionally crashes the server so Accelerator can capture a test dump.");
 }
 
@@ -129,7 +129,8 @@ Action Command_ProcessStackDump(int client, int args)
 	}
 
 	char dumpName[256];
-	char stackTrace[16384];
+	char stackTrace[32768];
+	char status[512];
 	GetCmdArg(1, dumpName, sizeof(dumpName));
 
 	if (!Accelerator_LocalGetStackDump(dumpName, stackTrace, sizeof(stackTrace)))
@@ -138,7 +139,8 @@ Action Command_ProcessStackDump(int client, int args)
 		return Plugin_Handled;
 	}
 
-	ReplyToCommand(client, "[Accelerator] Stack trace for %s:\n%s", dumpName, stackTrace);
+	Format(status, sizeof(status), "[Accelerator] Stack trace for %s:", dumpName);
+	ReplyMultiline(client, status, stackTrace);
 	return Plugin_Handled;
 }
 

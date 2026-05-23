@@ -154,6 +154,7 @@ class AcceleratorConfig(object):
   def configure_extension(self, compiler, context):
     compiler.cxxincludes += [
       os.path.join(context.currentSourcePath),
+      os.path.join(context.sourcePath, 'third_party'),
       os.path.join(self.sm_root, 'public'),
       os.path.join(self.sm_root, 'public', 'extensions'),
       os.path.join(self.sm_root, 'public', 'amtl', 'amtl'),

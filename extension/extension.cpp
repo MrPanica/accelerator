@@ -41,6 +41,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <paths.h>
+#include <sys/wait.h>
 
 class StderrInhibitor
 {
@@ -105,17 +106,33 @@ void operator delete[](void *ptr, size_t sz) {
 #include <google_breakpad/processor/process_state.h>
 #include <google_breakpad/processor/call_stack.h>
 #include <google_breakpad/processor/stack_frame.h>
+#include <google_breakpad/processor/stack_frame_cpu.h>
 #include <processor/pathname_stripper.h>
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <sstream>
 #include <streambuf>
+#include <fstream>
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
+#include <map>
 #include <mutex>
 #include <cstdarg>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 Accelerator g_accelerator;
 SMEXT_LINK(&g_accelerator);
@@ -181,6 +198,1728 @@ static void AcceleratorConsoleWarning(const char *fmt, ...)
 		fflush(log);
 		fclose(log);
 	}
+}
+
+namespace
+{
+	using nlohmann::json;
+	using google_breakpad::CallStack;
+	using google_breakpad::MemoryRegion;
+	using google_breakpad::Minidump;
+	using google_breakpad::MinidumpMemoryList;
+	using google_breakpad::MinidumpMemoryRegion;
+	using google_breakpad::MinidumpProcessor;
+	using google_breakpad::PathnameStripper;
+	using google_breakpad::ProcessResult;
+	using google_breakpad::ProcessState;
+	using google_breakpad::StackFrame;
+	using google_breakpad::StackFrameAMD64;
+	using google_breakpad::StackFrameX86;
+
+	struct PendingDumpEntry
+	{
+		std::string name;
+		std::string dumpPath;
+		std::string metadataPath;
+		bool hasMetadata = false;
+	};
+
+	struct LoadedDump
+	{
+		Minidump minidump;
+		ProcessState processState;
+
+		explicit LoadedDump(const std::string &path)
+			: minidump(path)
+		{
+		}
+	};
+
+	size_t HexWidthForAddress(uint64_t value);
+	std::string CollectHexDump(uint64_t base, const std::vector<uint8_t> &memory, const std::string &indent);
+	const char *FrameTrustName(StackFrame::FrameTrust trust);
+
+	enum class AcceleratorMode
+	{
+		Site,
+		Local,
+	};
+
+	bool HasSuffix(const std::string &value, const char *suffix)
+	{
+		size_t suffixLength = strlen(suffix);
+		return value.size() >= suffixLength && value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+	}
+
+	std::string ToLowerCopy(const std::string &value)
+	{
+		std::string lowered(value);
+		std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+			return static_cast<char>(std::tolower(ch));
+		});
+		return lowered;
+	}
+
+	bool IsTruthyCoreConfigValue(const char *key, bool defaultValue)
+	{
+		const char *raw = g_pSM->GetCoreConfigValue(key);
+		if (!raw || !raw[0]) {
+			return defaultValue;
+		}
+
+		std::string lowered = ToLowerCopy(raw);
+		if (lowered == "1" || lowered == "y" || lowered == "yes" || lowered == "true" || lowered == "on") {
+			return true;
+		}
+		if (lowered == "0" || lowered == "n" || lowered == "no" || lowered == "false" || lowered == "off") {
+			return false;
+		}
+		return defaultValue;
+	}
+
+	bool ShouldDeleteProcessedDump()
+	{
+		return IsTruthyCoreConfigValue("MinidumpDeleteAfterProcessing", true);
+	}
+
+	AcceleratorMode GetAcceleratorMode()
+	{
+		const char *raw = g_pSM->GetCoreConfigValue("MinidumpMode");
+		if (!raw || !raw[0]) {
+			return AcceleratorMode::Site;
+		}
+
+		std::string lowered = ToLowerCopy(raw);
+		if (lowered == "local") {
+			return AcceleratorMode::Local;
+		}
+		return AcceleratorMode::Site;
+	}
+
+	bool IsLocalMode()
+	{
+		return GetAcceleratorMode() == AcceleratorMode::Local;
+	}
+
+	bool CollectPendingDumps(std::vector<PendingDumpEntry> &entries, std::string *error = nullptr)
+	{
+		entries.clear();
+
+		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
+		if (!dumps) {
+			if (error) {
+				*error = "Failed to open dump directory";
+			}
+			return false;
+		}
+
+		while (dumps->MoreFiles()) {
+			if (!dumps->IsEntryFile()) {
+				dumps->NextEntry();
+				continue;
+			}
+
+			const char *entryName = dumps->GetEntryName();
+			std::string fileName(entryName ? entryName : "");
+			if (!HasSuffix(fileName, ".dmp")) {
+				dumps->NextEntry();
+				continue;
+			}
+
+			PendingDumpEntry entry;
+			entry.name = fileName.substr(0, fileName.size() - 4);
+			entry.dumpPath = std::string(dumpStoragePath) + "/" + fileName;
+			entry.metadataPath = entry.dumpPath + ".txt";
+			entry.hasMetadata = libsys->PathExists(entry.metadataPath.c_str());
+			entries.push_back(entry);
+			dumps->NextEntry();
+		}
+
+		libsys->CloseDirectory(dumps);
+		std::sort(entries.begin(), entries.end(), [](const PendingDumpEntry &left, const PendingDumpEntry &right) {
+			return left.name < right.name;
+		});
+		return true;
+	}
+
+	bool FindPendingDumpByName(const std::string &name, PendingDumpEntry &result, std::string *error = nullptr)
+	{
+		std::vector<PendingDumpEntry> entries;
+		if (!CollectPendingDumps(entries, error)) {
+			return false;
+		}
+
+		for (const PendingDumpEntry &entry : entries) {
+			if (entry.name == name) {
+				result = entry;
+				return true;
+			}
+		}
+
+		if (error) {
+			*error = "Dump not found";
+		}
+		return false;
+	}
+
+	std::string ReadWholeFile(const std::string &path)
+	{
+		std::ifstream input(path, std::ios::in | std::ios::binary);
+		if (!input) {
+			return "";
+		}
+
+		std::ostringstream buffer;
+		buffer << input.rdbuf();
+		return buffer.str();
+	}
+
+	bool WriteWholeFile(const std::string &path, const std::string &contents, std::string *error)
+	{
+		std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::trunc);
+		if (!output) {
+			if (error) {
+				*error = "Failed to open output file for writing";
+			}
+			return false;
+		}
+
+		output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+		if (!output.good()) {
+			if (error) {
+				*error = "Failed while writing the output file";
+			}
+			return false;
+		}
+
+		return true;
+	}
+
+	bool IsAbsolutePath(const std::string &path)
+	{
+		if (path.size() >= 1 && (path[0] == '/' || path[0] == '\\')) {
+			return true;
+		}
+		return path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':' &&
+			(path[2] == '/' || path[2] == '\\');
+	}
+
+	std::string TrimCopy(const std::string &value)
+	{
+		size_t start = 0;
+		while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+			start++;
+		}
+
+		size_t end = value.size();
+		while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+			end--;
+		}
+
+		return value.substr(start, end - start);
+	}
+
+	std::vector<std::string> SplitConfigPaths(const char *raw)
+	{
+		std::vector<std::string> paths;
+		if (!raw || !raw[0]) {
+			return paths;
+		}
+
+		std::string current;
+		for (const char *cursor = raw; ; ++cursor) {
+			char ch = *cursor;
+			if (ch == '\0' || ch == ';' || ch == ',' || ch == '\n' || ch == '\r') {
+				std::string trimmed = TrimCopy(current);
+				if (!trimmed.empty()) {
+					paths.push_back(trimmed);
+				}
+				current.clear();
+				if (ch == '\0') {
+					break;
+				}
+				continue;
+			}
+			current.push_back(ch);
+		}
+
+		return paths;
+	}
+
+	std::string JoinStrings(const std::vector<std::string> &items, const char *separator)
+	{
+		std::ostringstream out;
+		for (size_t i = 0; i < items.size(); ++i) {
+			if (i != 0) {
+				out << separator;
+			}
+			out << items[i];
+		}
+		return out.str();
+	}
+
+	std::string EscapeJson(const std::string &input)
+	{
+		std::ostringstream out;
+		for (unsigned char ch : input) {
+			switch (ch) {
+				case '\\': out << "\\\\"; break;
+				case '"': out << "\\\""; break;
+				case '\b': out << "\\b"; break;
+				case '\f': out << "\\f"; break;
+				case '\n': out << "\\n"; break;
+				case '\r': out << "\\r"; break;
+				case '\t': out << "\\t"; break;
+				default:
+					if (ch < 0x20) {
+						out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(ch) << std::dec << std::setfill(' ');
+					} else {
+						out << static_cast<char>(ch);
+					}
+			}
+		}
+		return out.str();
+	}
+
+	std::string QuoteCommandArg(const std::string &value)
+	{
+		std::string escaped;
+		escaped.reserve(value.size() + 2);
+		escaped.push_back('"');
+		for (char ch : value) {
+			if (ch == '"') {
+				escaped += "\\\"";
+			} else {
+				escaped.push_back(ch);
+			}
+		}
+		escaped.push_back('"');
+		return escaped;
+	}
+
+	bool PathExistsFile(const std::string &path)
+	{
+		return libsys->PathExists(path.c_str());
+	}
+
+	std::string GetConfiguredCarburetorPath()
+	{
+		const char *configured = g_pSM->GetCoreConfigValue("MinidumpLocalCarburetorPath");
+		if (configured && configured[0]) {
+			if (IsAbsolutePath(configured)) {
+				return configured;
+			}
+			return std::string(dumpStoragePath) + "/" + configured;
+		}
+
+#if defined _WINDOWS
+		char path[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/" PLATFORM_ARCH_FOLDER "carburetor.exe");
+		return path;
+#else
+		char path[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/" PLATFORM_ARCH_FOLDER "carburetor");
+		return path;
+#endif
+	}
+
+	std::vector<std::string> GetConfiguredLocalSymbolPaths()
+	{
+		std::vector<std::string> results;
+		auto appendIfUniqueExisting = [&](const std::string &path) {
+			if (path.empty() || (!PathExistsFile(path) && !libsys->IsPathDirectory(path.c_str()))) {
+				return;
+			}
+			if (std::find(results.begin(), results.end(), path) == results.end()) {
+				results.push_back(path);
+			}
+		};
+
+		for (const std::string &item : SplitConfigPaths(g_pSM->GetCoreConfigValue("MinidumpLocalSymbolPath"))) {
+			if (IsAbsolutePath(item)) {
+				appendIfUniqueExisting(item);
+			} else {
+				char resolved[PLATFORM_MAX_PATH];
+				g_pSM->BuildPath(Path_SM, resolved, sizeof(resolved), "%s", item.c_str());
+				appendIfUniqueExisting(resolved);
+			}
+		}
+
+		char dumpSymbols[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, dumpSymbols, sizeof(dumpSymbols), "data/dumps/symbols");
+		appendIfUniqueExisting(dumpSymbols);
+
+		return results;
+	}
+
+	std::string GetLocalSymbolStoreRoot()
+	{
+		char dumpSymbols[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, dumpSymbols, sizeof(dumpSymbols), "data/dumps/symbols");
+		return dumpSymbols;
+	}
+
+	std::string GetLocalOutputRoot()
+	{
+		char outputRoot[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, outputRoot, sizeof(outputRoot), "data/dumps/outputs");
+		return outputRoot;
+	}
+
+	bool EnsureDirectoryExists(const std::string &path, std::string &error)
+	{
+		try {
+			std::filesystem::create_directories(path);
+			return true;
+		} catch (const std::exception &ex) {
+			error = ex.what();
+			return false;
+		}
+	}
+
+	bool RunCommandCapture(const std::string &commandLine, std::string &output, int &exitCode, std::string &error)
+	{
+		output.clear();
+		exitCode = -1;
+
+#if defined _WINDOWS
+		FILE *pipe = _popen(commandLine.c_str(), "r");
+#else
+		FILE *pipe = popen((commandLine + " 2>&1").c_str(), "r");
+#endif
+		if (!pipe) {
+			error = "Failed to launch external command";
+			return false;
+		}
+
+		char buffer[4096];
+		while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+			output += buffer;
+		}
+
+#if defined _WINDOWS
+		exitCode = _pclose(pipe);
+#else
+		exitCode = pclose(pipe);
+		if (WIFEXITED(exitCode)) {
+			exitCode = WEXITSTATUS(exitCode);
+		}
+#endif
+
+		return true;
+	}
+
+	bool TryRunCarburetorRaw(const PendingDumpEntry &entry, std::string &output, std::string &error)
+	{
+		std::string carburetorPath = GetConfiguredCarburetorPath();
+		if (carburetorPath.empty() || !PathExistsFile(carburetorPath)) {
+			error = "Carburetor binary was not found. Configure MinidumpLocalCarburetorPath or place carburetor in addons/sourcemod/bin.";
+			return false;
+		}
+
+		std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+
+		std::ostringstream commandLine;
+		commandLine << QuoteCommandArg(carburetorPath) << " " << QuoteCommandArg(entry.dumpPath);
+		for (const std::string &symbolPath : symbolPaths) {
+			commandLine << " " << QuoteCommandArg(symbolPath);
+		}
+
+		int exitCode = -1;
+		if (!RunCommandCapture(commandLine.str(), output, exitCode, error)) {
+			return false;
+		}
+		if (exitCode != 0) {
+			std::ostringstream out;
+			out << "Carburetor exited with code " << exitCode;
+			if (!output.empty()) {
+				out << ": " << output;
+			}
+			error = out.str();
+			return false;
+		}
+
+		return true;
+	}
+
+	std::string SymbolLeafNameForModule(const std::string &debugFileName)
+	{
+		std::string lowered = ToLowerCopy(debugFileName);
+		if (lowered.size() > 4 && lowered.substr(lowered.size() - 4) == ".pdb") {
+			return debugFileName.substr(0, debugFileName.size() - 4) + ".sym";
+		}
+		return debugFileName + ".sym";
+	}
+
+	bool LooksLikeSymbolizableModulePath(const std::string &path)
+	{
+		if (path.empty() || path[0] != '/') {
+			return false;
+		}
+
+		const std::string lowered = ToLowerCopy(path);
+		if (lowered.find("/dev/shm/") == 0) {
+			return false;
+		}
+		if (lowered.find(".mmdb") != std::string::npos) {
+			return false;
+		}
+		if (HasSuffix(lowered, ".vpk") || HasSuffix(lowered, ".txt") || HasSuffix(lowered, ".cfg")) {
+			return false;
+		}
+		if (HasSuffix(lowered, ".so") || HasSuffix(lowered, ".srv.so") || HasSuffix(lowered, ".dll")) {
+			return true;
+		}
+		if (lowered.find("/bin/srcds_linux") != std::string::npos || HasSuffix(lowered, "/srcds_linux")) {
+			return true;
+		}
+		return false;
+	}
+
+	bool GenerateLocalSymbolFile(const google_breakpad::CodeModule *module, std::string &storedPath, std::string &error)
+	{
+#if !defined _LINUX
+		error = "Automatic local symbol generation is only implemented for Linux";
+		return false;
+#else
+		storedPath.clear();
+		if (!module) {
+			error = "Module is null";
+			return false;
+		}
+
+		std::string debugFile = module->debug_file();
+		if (debugFile.empty() || debugFile[0] != '/') {
+			debugFile = module->code_file();
+		}
+		if (debugFile.empty() || debugFile[0] != '/') {
+			error = "Module path is not absolute";
+			return false;
+		}
+		if (!LooksLikeSymbolizableModulePath(debugFile)) {
+			error = "Module is not a supported symbolizable binary";
+			return false;
+		}
+
+		std::string debugFileName = PathnameStripper::File(module->debug_file());
+		if (debugFileName.empty()) {
+			debugFileName = PathnameStripper::File(module->code_file());
+		}
+		if (debugFileName.empty()) {
+			error = "Module debug file name is empty";
+			return false;
+		}
+
+		const std::string identifier = module->debug_identifier();
+		if (identifier.empty()) {
+			error = "Module debug identifier is empty";
+			return false;
+		}
+
+		const std::string storeRoot = GetLocalSymbolStoreRoot();
+		const std::string moduleDir = storeRoot + "/" + debugFileName + "/" + identifier;
+		if (!EnsureDirectoryExists(moduleDir, error)) {
+			return false;
+		}
+
+		storedPath = moduleDir + "/" + SymbolLeafNameForModule(debugFileName);
+		if (PathExistsFile(storedPath)) {
+			return true;
+		}
+
+		auto debugFileDir = google_breakpad::DirName(debugFile);
+		std::vector<std::string> debugDirs{
+			debugFileDir,
+			debugFileDir + "/.debug",
+			"/usr/lib/debug" + debugFileDir,
+		};
+
+		std::ostringstream outputStream;
+		google_breakpad::DumpOptions options(ALL_SYMBOL_DATA, true, true, false);
+		{
+			StderrInhibitor stderrInhibitor;
+			if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", debugDirs, options, outputStream)) {
+				outputStream.str("");
+				outputStream.clear();
+				if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", {}, options, outputStream)) {
+					error = "WriteSymbolFile failed";
+					return false;
+				}
+			}
+		}
+
+		std::string writeError;
+		if (!WriteWholeFile(storedPath, outputStream.str(), &writeError)) {
+			error = writeError;
+			return false;
+		}
+
+		return true;
+#endif
+	}
+
+	const CallStack *GetRequestingThreadStack(const ProcessState &processState, int &threadIndex);
+
+	std::set<std::string> CollectRequestingThreadModulePaths(const LoadedDump &loadedDump)
+	{
+		std::set<std::string> modulePaths;
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(loadedDump.processState, threadIndex);
+		if (!stack) {
+			return modulePaths;
+		}
+
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			const StackFrame *frame = frames->at(i);
+			if (!frame || !frame->module) {
+				continue;
+			}
+
+			std::string path = frame->module->debug_file();
+			if (path.empty() || path[0] != '/') {
+				path = frame->module->code_file();
+			}
+			if (LooksLikeSymbolizableModulePath(path)) {
+				modulePaths.insert(path);
+			}
+		}
+
+		return modulePaths;
+	}
+
+	void EnsureLocalSymbolsForDump(const LoadedDump &loadedDump)
+	{
+		const auto *modules = loadedDump.processState.modules();
+		if (!modules) {
+			return;
+		}
+
+		std::string rootError;
+		if (!EnsureDirectoryExists(GetLocalSymbolStoreRoot(), rootError)) {
+			AcceleratorConsoleWarning("Failed to create local symbol store: %s", rootError.c_str());
+			return;
+		}
+
+		unsigned int generated = 0;
+		unsigned int failed = 0;
+		std::set<std::string> requestedPaths = CollectRequestingThreadModulePaths(loadedDump);
+		for (unsigned int i = 0; i < modules->module_count(); ++i) {
+			const google_breakpad::CodeModule *module = modules->GetModuleAtIndex(i);
+			if (!module) {
+				continue;
+			}
+
+			std::string modulePath = module->debug_file();
+			if (modulePath.empty() || modulePath[0] != '/') {
+				modulePath = module->code_file();
+			}
+			if (!requestedPaths.empty() && requestedPaths.find(modulePath) == requestedPaths.end()) {
+				continue;
+			}
+
+			std::string storedPath;
+			std::string error;
+			if (GenerateLocalSymbolFile(module, storedPath, error)) {
+				generated++;
+			} else {
+				failed++;
+				if (!error.empty()) {
+					AcceleratorConsoleWarning("Local symbol generation skipped for %s: %s",
+						module ? module->code_file().c_str() : "(null)", error.c_str());
+				}
+			}
+		}
+
+		AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, %u skipped/failed", generated, failed);
+	}
+
+	bool ParseCarburetorJson(const std::string &raw, json &document, std::string &error)
+	{
+		try {
+			document = json::parse(raw);
+			if (!document.is_object()) {
+				error = "Carburetor did not return a JSON object";
+				return false;
+			}
+			return true;
+		} catch (const std::exception &ex) {
+			error = ex.what();
+			return false;
+		}
+	}
+
+	int DecodeBase64Value(unsigned char ch)
+	{
+		if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+		if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+		if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+		if (ch == '+') return 62;
+		if (ch == '/') return 63;
+		return -1;
+	}
+
+	bool DecodeBase64(const std::string &input, std::vector<uint8_t> &output)
+	{
+		output.clear();
+		int val = 0;
+		int valb = -8;
+		for (unsigned char ch : input) {
+			if (std::isspace(ch)) {
+				continue;
+			}
+			if (ch == '=') {
+				break;
+			}
+			int decoded = DecodeBase64Value(ch);
+			if (decoded < 0) {
+				return false;
+			}
+			val = (val << 6) + decoded;
+			valb += 6;
+			if (valb >= 0) {
+				output.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+				valb -= 8;
+			}
+		}
+		return true;
+	}
+
+	uint64_t JsonUInt64(const json &value, uint64_t fallback = 0)
+	{
+		if (value.is_number_unsigned()) {
+			return value.get<uint64_t>();
+		}
+		if (value.is_number_integer()) {
+			return static_cast<uint64_t>(value.get<int64_t>());
+		}
+		if (value.is_string()) {
+			try {
+				return std::stoull(value.get<std::string>());
+			} catch (...) {
+				return fallback;
+			}
+		}
+		return fallback;
+	}
+
+	std::string JsonString(const json &value)
+	{
+		return value.is_string() ? value.get<std::string>() : "";
+	}
+
+	std::string RenderCarburetorInstructions(const json &instructionsValue, uint64_t ip, const std::string &indent)
+	{
+		if (!instructionsValue.is_array()) {
+			return "";
+		}
+
+		std::vector<json> instructions;
+		for (const auto &item : instructionsValue) {
+			if (item.is_object()) {
+				instructions.push_back(item);
+			}
+		}
+		if (instructions.empty()) {
+			return "";
+		}
+
+		int crashOpcode = -1;
+		size_t bytesPerLine = 0;
+		for (size_t i = 0; i < instructions.size(); ++i) {
+			uint64_t currentOffset = JsonUInt64(instructions[i].value("offset", json()));
+			uint64_t nextOffset = (i + 1 < instructions.size()) ? JsonUInt64(instructions[i + 1].value("offset", json())) : currentOffset;
+			if (ip >= currentOffset && (i + 1 == instructions.size() || ip < nextOffset)) {
+				crashOpcode = static_cast<int>(i);
+				break;
+			}
+		}
+
+		if (crashOpcode >= 0) {
+			for (size_t i = 0; i < instructions.size(); ++i) {
+				if (static_cast<int>(i) < crashOpcode - 5 || static_cast<int>(i) > crashOpcode + 5) {
+					continue;
+				}
+				const std::string hex = JsonString(instructions[i].value("hex", json()));
+				bytesPerLine = std::max(bytesPerLine, hex.size() / 2);
+			}
+		}
+
+		std::ostringstream out;
+		for (size_t i = 0; i < instructions.size(); ++i) {
+			if (crashOpcode >= 0 && (static_cast<int>(i) < crashOpcode - 5 || static_cast<int>(i) > crashOpcode + 5)) {
+				continue;
+			}
+
+			std::string line = indent;
+			if (crashOpcode >= 0 && static_cast<int>(i) == crashOpcode && line.size() >= 3) {
+				line = "  >" + line.substr(3);
+			}
+
+			const uint64_t offset = JsonUInt64(instructions[i].value("offset", json()));
+			const std::string hex = JsonString(instructions[i].value("hex", json()));
+			const std::string mnemonic = JsonString(instructions[i].value("mnemonic", json()));
+
+			std::ostringstream hexFormatted;
+			for (size_t index = 0; index < hex.size(); index += 2) {
+				if (index > 0) {
+					hexFormatted << ' ';
+				}
+				hexFormatted << hex.substr(index, std::min<size_t>(2, hex.size() - index));
+			}
+
+			out << line << std::hex << std::setw(8) << std::setfill('0') << offset << std::dec << std::setfill(' ')
+				<< "  " << std::left << std::setw(static_cast<int>((bytesPerLine * 3) > 0 ? (bytesPerLine * 3) - 1 : 0))
+				<< hexFormatted.str() << std::right << "  " << mnemonic << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorRegisters(const json &registersValue, const std::string &indent)
+	{
+		if (!registersValue.is_object()) {
+			return "";
+		}
+
+		static const std::vector<std::string> preferredOrder = {
+			"eip", "esp", "ebp", "ebx",
+			"esi", "edi", "eax", "ecx",
+			"edx", "efl",
+			"rax", "rdx", "rcx", "rbx",
+			"rsi", "rdi", "rbp", "rsp",
+			"r8", "r9", "r10", "r11",
+			"r12", "r13", "r14", "r15", "rip",
+		};
+
+		std::vector<std::pair<std::string, uint64_t>> registers;
+		std::set<std::string> printed;
+
+		for (const std::string &name : preferredOrder) {
+			auto it = registersValue.find(name);
+			if (it == registersValue.end()) {
+				continue;
+			}
+			registers.emplace_back(name, JsonUInt64(*it));
+			printed.insert(name);
+		}
+
+		for (auto it = registersValue.begin(); it != registersValue.end(); ++it) {
+			if (printed.find(it.key()) != printed.end()) {
+				continue;
+			}
+			registers.emplace_back(it.key(), JsonUInt64(it.value()));
+		}
+
+		if (registers.empty()) {
+			return "";
+		}
+
+		size_t width = 8;
+		for (const auto &entry : registers) {
+			width = std::max(width, HexWidthForAddress(entry.second));
+		}
+
+		std::ostringstream out;
+		size_t count = 0;
+		out << indent;
+		for (const auto &entry : registers) {
+			out << entry.first << ": 0x" << std::hex << std::setw(static_cast<int>(width)) << std::setfill('0') << entry.second << std::dec << std::setfill(' ');
+			count++;
+			if (count % 4 == 0) {
+				out << "\n";
+				if (count != registers.size()) {
+					out << indent;
+				}
+			} else if (count != registers.size()) {
+				out << "  ";
+			}
+		}
+		if (count % 4 != 0) {
+			out << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorStack(const json &document)
+	{
+		std::ostringstream out;
+
+		if (document.value("crashed", false)) {
+			out << JsonString(document.value("crash_reason", json())) << " accessing 0x"
+				<< std::hex << JsonUInt64(document.value("crash_address", json())) << std::dec << "\n\n";
+		}
+
+		if (!document.contains("requesting_thread") || !document["requesting_thread"].is_number_integer()) {
+			return out.str();
+		}
+
+		const int requestingThread = document["requesting_thread"].get<int>();
+		if (!document.contains("threads") || !document["threads"].is_array() ||
+			requestingThread < 0 || requestingThread >= static_cast<int>(document["threads"].size())) {
+			return out.str();
+		}
+
+		const json &thread = document["threads"][requestingThread];
+		if (!thread.is_array()) {
+			return out.str();
+		}
+
+		out << "Thread " << requestingThread << " (crashed):\n";
+
+		const size_t numFrames = thread.size();
+		const size_t frameDigits = std::max<size_t>(1, std::to_string(numFrames > 0 ? numFrames - 1 : 0).size());
+
+		for (size_t i = 0; i < numFrames; ++i) {
+			const json &frame = thread[i];
+			if (!frame.is_object()) {
+				continue;
+			}
+
+			std::ostringstream prefix;
+			prefix << std::setw(static_cast<int>(frameDigits)) << std::setfill(' ') << i << ": ";
+			const std::string prefixText = prefix.str();
+			const std::string indent = "  " + std::string(prefixText.size(), ' ');
+
+			out << "  " << prefixText << JsonString(frame.value("rendered", json())) << "\n";
+
+			if (frame.contains("url") && frame["url"].is_string()) {
+				out << indent << frame["url"].get<std::string>() << "\n";
+			}
+
+			if (frame.contains("registers")) {
+				out << RenderCarburetorRegisters(frame["registers"], indent);
+				out << "\n";
+			}
+
+			if (frame.contains("instructions")) {
+				out << RenderCarburetorInstructions(frame["instructions"], JsonUInt64(frame.value("instruction", json())), indent);
+				out << "\n";
+			}
+
+			if (frame.contains("stack") && frame["stack"].is_string()) {
+				std::vector<uint8_t> decoded;
+				if (DecodeBase64(frame["stack"].get<std::string>(), decoded)) {
+					uint64_t base = 0;
+					if (frame.contains("registers") && frame["registers"].is_object()) {
+						const json &registers = frame["registers"];
+						if (registers.contains("esp")) {
+							base = JsonUInt64(registers["esp"]);
+						} else if (registers.contains("rsp")) {
+							base = JsonUInt64(registers["rsp"]);
+						}
+					}
+					out << CollectHexDump(base, decoded, indent);
+					out << "\n";
+				}
+			}
+
+			out << indent << "Found via " << FrameTrustName(static_cast<StackFrame::FrameTrust>(frame.value("trust", 0))) << "\n\n\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderCarburetorMemory(const json &document, std::string &error)
+	{
+		if (!document.contains("memory") || !document["memory"].is_array()) {
+			error = "No memory regions in carburetor JSON";
+			return "";
+		}
+
+		std::vector<json> regions;
+		for (const auto &region : document["memory"]) {
+			if (region.is_object()) {
+				regions.push_back(region);
+			}
+		}
+		if (regions.empty()) {
+			error = "No memory regions in carburetor JSON";
+			return "";
+		}
+
+		std::sort(regions.begin(), regions.end(), [](const json &left, const json &right) {
+			return JsonUInt64(left.value("base", json())) < JsonUInt64(right.value("base", json()));
+		});
+
+		const uint64_t start = JsonUInt64(regions.front().value("base", json()));
+		const uint64_t end = JsonUInt64(regions.back().value("base", json())) + JsonUInt64(regions.back().value("size", json()));
+		const uint64_t size = end > start ? (end - start) : 0;
+
+		uint64_t real = 0;
+		for (const auto &region : regions) {
+			real += JsonUInt64(region.value("size", json()));
+		}
+
+		std::ostringstream out;
+		const size_t addressWidth = HexWidthForAddress(end);
+		out << "Got " << real << " bytes of memory covering "
+			<< std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << start << " to "
+			<< std::setw(static_cast<int>(addressWidth)) << end << std::dec << std::setfill(' ')
+			<< " (" << (size > 0 ? (static_cast<double>(real) / static_cast<double>(size)) : 1.0) << "% coverage)\n\n";
+
+		for (const auto &region : regions) {
+			const uint64_t base = JsonUInt64(region.value("base", json()));
+			const uint64_t declaredSize = JsonUInt64(region.value("size", json()));
+			std::vector<uint8_t> decoded;
+			if (!DecodeBase64(JsonString(region.value("data", json())), decoded)) {
+				error = "Failed to decode base64 memory region";
+				return "";
+			}
+			if (decoded.size() != declaredSize) {
+				error = "Decoded memory region size mismatch";
+				return "";
+			}
+			out << CollectHexDump(base, decoded, "");
+			out << "\n";
+		}
+
+		return out.str();
+	}
+
+	size_t HexWidthForAddress(uint64_t value)
+	{
+		return value > 0xFFFFFFFFULL ? 16 : 8;
+	}
+
+	std::string RenderFrame(const StackFrame *frame)
+	{
+		std::ostringstream out;
+		out << std::hex;
+		if (frame->module) {
+			out << PathnameStripper::File(frame->module->code_file());
+			if (!frame->function_name.empty()) {
+				out << "!" << frame->function_name;
+				if (!frame->source_file_name.empty()) {
+					out << " [ " << PathnameStripper::File(frame->source_file_name) << ":" << std::dec << frame->source_line
+						<< std::hex << " + 0x" << (frame->ReturnAddress() - frame->source_line_base) << " ]";
+				} else {
+					out << " + 0x" << (frame->ReturnAddress() - frame->function_base);
+				}
+			} else {
+				out << " + 0x" << (frame->ReturnAddress() - frame->module->base_address());
+			}
+		} else {
+			out << "0x" << frame->ReturnAddress();
+		}
+		out << std::dec;
+		return out.str();
+	}
+
+	std::optional<std::vector<uint8_t>> GetFrameStackContents(const StackFrame *frame,
+		const StackFrame *prevFrame,
+		const std::string &cpu,
+		const MemoryRegion *memory)
+	{
+		if (!memory) {
+			return {};
+		}
+
+		uint64_t stackBegin = 0;
+		uint64_t stackEnd = 0;
+		if (cpu == "x86") {
+			const StackFrameX86 *frameX86 = static_cast<const StackFrameX86 *>(frame);
+			const StackFrameX86 *prevFrameX86 = static_cast<const StackFrameX86 *>(prevFrame);
+			if ((frameX86->context_validity & StackFrameX86::CONTEXT_VALID_ESP) &&
+				(prevFrameX86->context_validity & StackFrameX86::CONTEXT_VALID_ESP)) {
+				stackBegin = frameX86->context.esp;
+				stackEnd = prevFrameX86->context.esp;
+			}
+		} else if (cpu == "amd64") {
+			const StackFrameAMD64 *frameAMD64 = static_cast<const StackFrameAMD64 *>(frame);
+			const StackFrameAMD64 *prevFrameAMD64 = static_cast<const StackFrameAMD64 *>(prevFrame);
+			if ((frameAMD64->context_validity & StackFrameAMD64::CONTEXT_VALID_RSP) &&
+				(prevFrameAMD64->context_validity & StackFrameAMD64::CONTEXT_VALID_RSP)) {
+				stackBegin = frameAMD64->context.rsp;
+				stackEnd = prevFrameAMD64->context.rsp;
+			}
+		}
+
+		if (!stackBegin || !stackEnd || stackEnd <= stackBegin) {
+			return {};
+		}
+
+		size_t stackSize = static_cast<size_t>(stackEnd - stackBegin);
+		std::vector<uint8_t> bytes;
+		bytes.reserve(stackSize);
+
+		for (uint64_t address = stackBegin; address < stackEnd; ++address) {
+			uint8_t value = 0;
+			if (!memory->GetMemoryAtAddress(address, &value)) {
+				return {};
+			}
+			bytes.push_back(value);
+		}
+
+		return bytes;
+	}
+
+	std::string CollectHexDump(uint64_t base, const std::vector<uint8_t> &memory, const std::string &indent)
+	{
+		std::ostringstream out;
+		const size_t rowBytes = 16;
+		const size_t chunkBytes = 8;
+		const size_t addressWidth = HexWidthForAddress(base + memory.size());
+
+		for (size_t offset = 0; offset < memory.size(); offset += rowBytes) {
+			out << indent << std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << (base + offset) << "  ";
+
+			std::string ascii;
+			for (size_t i = 0; i < rowBytes; ++i) {
+				if (offset + i < memory.size()) {
+					unsigned byte = memory[offset + i];
+					out << std::setw(2) << byte << " ";
+					ascii.push_back((byte >= 32 && byte <= 126) ? static_cast<char>(byte) : '.');
+				} else {
+					out << "   ";
+					ascii.push_back(' ');
+				}
+
+				if (i + 1 < rowBytes && ((i + 1) % chunkBytes) == 0) {
+					out << ' ';
+				}
+			}
+
+			out << " " << ascii << "\n";
+		}
+
+		out << std::dec << std::setfill(' ');
+		return out.str();
+	}
+
+	void AppendRegisterDump(std::ostringstream &out, const StackFrame *frame, const std::string &indent)
+	{
+		if (!frame) {
+			return;
+		}
+
+		auto appendLine = [&](const std::vector<std::pair<const char *, uint64_t>> &registers) {
+			size_t count = 0;
+			size_t registerWidth = 8;
+			for (const auto &entry : registers) {
+				registerWidth = std::max(registerWidth, HexWidthForAddress(entry.second));
+			}
+			out << indent;
+			for (const auto &entry : registers) {
+				out << entry.first << ": 0x" << std::hex << std::setw(static_cast<int>(registerWidth)) << std::setfill('0') << entry.second << std::dec << std::setfill(' ');
+				count++;
+				if (count % 4 == 0) {
+					out << "\n";
+					if (count != registers.size()) {
+						out << indent;
+					}
+				} else if (count != registers.size()) {
+					out << "  ";
+				}
+			}
+			if (count % 4 != 0) {
+				out << "\n";
+			}
+		};
+
+		if (const auto *frameX86 = dynamic_cast<const StackFrameX86 *>(frame)) {
+			std::vector<std::pair<const char *, uint64_t>> registers = {
+				{"eip", frameX86->context.eip},
+				{"esp", frameX86->context.esp},
+				{"ebp", frameX86->context.ebp},
+				{"ebx", frameX86->context.ebx},
+				{"esi", frameX86->context.esi},
+				{"edi", frameX86->context.edi},
+				{"eax", frameX86->context.eax},
+				{"ecx", frameX86->context.ecx},
+				{"edx", frameX86->context.edx},
+				{"efl", frameX86->context.eflags},
+			};
+			appendLine(registers);
+		} else if (const auto *frameAMD64 = dynamic_cast<const StackFrameAMD64 *>(frame)) {
+			std::vector<std::pair<const char *, uint64_t>> registers = {
+				{"rip", frameAMD64->context.rip},
+				{"rsp", frameAMD64->context.rsp},
+				{"rbp", frameAMD64->context.rbp},
+				{"rax", frameAMD64->context.rax},
+				{"rbx", frameAMD64->context.rbx},
+				{"rcx", frameAMD64->context.rcx},
+				{"rdx", frameAMD64->context.rdx},
+				{"rsi", frameAMD64->context.rsi},
+				{"rdi", frameAMD64->context.rdi},
+				{"r8", frameAMD64->context.r8},
+				{"r9", frameAMD64->context.r9},
+				{"r10", frameAMD64->context.r10},
+				{"r11", frameAMD64->context.r11},
+				{"r12", frameAMD64->context.r12},
+				{"r13", frameAMD64->context.r13},
+				{"r14", frameAMD64->context.r14},
+				{"r15", frameAMD64->context.r15},
+			};
+			appendLine(registers);
+		}
+	}
+
+	const char *FrameTrustName(StackFrame::FrameTrust trust)
+	{
+		static const char *names[] = {
+			"unknown",
+			"stack scanning",
+			"call frame info with scanning",
+			"previous frame's frame pointer",
+			"call frame info",
+			"external stack walker",
+			"instruction pointer in context",
+		};
+
+		size_t index = static_cast<size_t>(trust);
+		if (index >= (sizeof(names) / sizeof(names[0]))) {
+			return names[0];
+		}
+		return names[index];
+	}
+
+	bool LoadDump(LoadedDump &loadedDump, std::string &error)
+	{
+		if (!loadedDump.minidump.Read()) {
+			error = "Minidump could not be read";
+			return false;
+		}
+
+		MinidumpProcessor processor(nullptr, nullptr);
+		ProcessResult result;
+		{
+			StderrInhibitor stderrInhibitor;
+			result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+		}
+		if (result != google_breakpad::PROCESS_OK) {
+			std::ostringstream out;
+			out << "MinidumpProcessor failed with status " << result;
+			error = out.str();
+			return false;
+		}
+
+		return true;
+	}
+
+	const CallStack *GetRequestingThreadStack(const ProcessState &processState, int &threadIndex)
+	{
+		threadIndex = processState.requesting_thread();
+		if (threadIndex < 0) {
+			threadIndex = 0;
+		}
+
+		const auto *threads = processState.threads();
+		if (!threads || threads->empty() || threadIndex >= static_cast<int>(threads->size())) {
+			return nullptr;
+		}
+		return threads->at(threadIndex);
+	}
+
+	std::string RenderShortStackTrace(const ProcessState &processState)
+	{
+		std::ostringstream out;
+		out << "Crash reason: " << processState.crash_reason() << "\n";
+		out << "Crash address: 0x" << std::hex << processState.crash_address() << std::dec << "\n";
+
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(processState, threadIndex);
+		if (!stack) {
+			out << "No crashed thread stack is available.\n";
+			return out.str();
+		}
+
+		out << "Crashed thread: " << threadIndex << "\n";
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			out << "#" << i << " " << RenderFrame(frames->at(i)) << "\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderVerboseStack(const LoadedDump &loadedDump)
+	{
+		std::ostringstream out;
+		const ProcessState &processState = loadedDump.processState;
+		const std::string cpu = processState.system_info() ? processState.system_info()->cpu : "";
+
+		int threadIndex = 0;
+		const CallStack *stack = GetRequestingThreadStack(processState, threadIndex);
+		if (!stack) {
+			out << "No crashed thread stack is available.\n";
+			return out.str();
+		}
+
+		out << processState.crash_reason() << " accessing 0x" << std::hex << processState.crash_address() << std::dec << "\n\n";
+		out << "Thread " << threadIndex << " (crashed):\n\n";
+
+		const auto *threadMemoryRegions = processState.thread_memory_regions();
+		const MemoryRegion *threadMemory = nullptr;
+		if (threadMemoryRegions && threadIndex >= 0 && threadIndex < static_cast<int>(threadMemoryRegions->size())) {
+			threadMemory = threadMemoryRegions->at(threadIndex);
+		}
+
+		const auto *frames = stack->frames();
+		for (size_t i = 0; i < frames->size(); ++i) {
+			const StackFrame *frame = frames->at(i);
+			std::string prefix = std::to_string(i) + ": ";
+			std::string indent = "  " + std::string(prefix.size(), ' ');
+
+			out << "  " << prefix << RenderFrame(frame) << "\n";
+			AppendRegisterDump(out, frame, indent);
+
+			if (threadMemory && i + 1 < frames->size()) {
+				std::optional<std::vector<uint8_t>> stackBytes = GetFrameStackContents(frame, frames->at(i + 1), cpu, threadMemory);
+				if (stackBytes && !stackBytes->empty()) {
+					uint64_t stackBase = 0;
+					if (cpu == "x86") {
+						stackBase = static_cast<const StackFrameX86 *>(frame)->context.esp;
+					} else if (cpu == "amd64") {
+						stackBase = static_cast<const StackFrameAMD64 *>(frame)->context.rsp;
+					}
+					out << CollectHexDump(stackBase, *stackBytes, indent);
+				}
+			}
+
+			out << indent << "Found via " << FrameTrustName(frame->trust) << "\n\n";
+		}
+
+		return out.str();
+	}
+
+	std::string RenderMemoryDump(Minidump &minidump)
+	{
+		std::ostringstream out;
+		MinidumpMemoryList *memoryList = minidump.GetMemoryList();
+		if (!memoryList || memoryList->region_count() == 0) {
+			out << "No memory regions in input\n";
+			return out.str();
+		}
+
+		uint64_t start = std::numeric_limits<uint64_t>::max();
+		uint64_t end = 0;
+		uint64_t totalBytes = 0;
+		for (unsigned int i = 0; i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			start = std::min(start, region->GetBase());
+			end = std::max(end, region->GetBase() + region->GetSize());
+			totalBytes += region->GetSize();
+		}
+
+		uint64_t covered = end > start ? (end - start) : 0;
+		double coverage = covered > 0 ? (static_cast<double>(totalBytes) / static_cast<double>(covered)) * 100.0 : 100.0;
+		const size_t addressWidth = HexWidthForAddress(end);
+		out << "Got " << totalBytes << " bytes of memory covering "
+			<< std::hex << std::setw(static_cast<int>(addressWidth)) << std::setfill('0') << start << " to "
+			<< std::setw(static_cast<int>(addressWidth)) << end << std::dec << std::setfill(' ')
+			<< " (" << std::fixed << std::setprecision(2) << coverage << "% coverage)\n";
+
+		for (unsigned int i = 0; i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			const uint8_t *buffer = region->GetMemory();
+			if (!buffer || region->GetSize() == 0) {
+				continue;
+			}
+
+			std::vector<uint8_t> bytes(buffer, buffer + region->GetSize());
+			out << "\nRegion " << i << ": base=0x" << std::hex << region->GetBase() << std::dec << " size=" << region->GetSize() << "\n";
+			out << CollectHexDump(region->GetBase(), bytes, "  ");
+		}
+
+		return out.str();
+	}
+
+	std::string RenderRawJson(LoadedDump &loadedDump)
+	{
+		std::ostringstream out;
+		const ProcessState &processState = loadedDump.processState;
+
+		out << "{\n";
+		out << "  \"input_file\": \"" << EscapeJson(loadedDump.minidump.path()) << "\",\n";
+		out << "  \"crashed\": " << (processState.crashed() ? "true" : "false") << ",\n";
+		out << "  \"crash_reason\": \"" << EscapeJson(processState.crash_reason()) << "\",\n";
+		out << "  \"crash_address\": " << processState.crash_address() << ",\n";
+		out << "  \"requesting_thread\": " << processState.requesting_thread() << ",\n";
+		out << "  \"threads\": [\n";
+
+		const auto *threads = processState.threads();
+		for (size_t threadIndex = 0; threads && threadIndex < threads->size(); ++threadIndex) {
+			const CallStack *stack = threads->at(threadIndex);
+			out << "    {\n";
+			out << "      \"index\": " << threadIndex << ",\n";
+			out << "      \"frames\": [\n";
+
+			const auto *frames = stack->frames();
+			for (size_t frameIndex = 0; frameIndex < frames->size(); ++frameIndex) {
+				const StackFrame *frame = frames->at(frameIndex);
+				out << "        {"
+					<< "\"frame\": " << frameIndex
+					<< ", \"rendered\": \"" << EscapeJson(RenderFrame(frame)) << "\"";
+				if (frame->module) {
+					out << ", \"module\": \"" << EscapeJson(PathnameStripper::File(frame->module->code_file())) << "\"";
+				}
+				if (!frame->function_name.empty()) {
+					out << ", \"function\": \"" << EscapeJson(frame->function_name) << "\"";
+				}
+				out << "}";
+				if (frameIndex + 1 < frames->size()) {
+					out << ",";
+				}
+				out << "\n";
+			}
+
+			out << "      ]\n";
+			out << "    }";
+			if (threadIndex + 1 < threads->size()) {
+				out << ",";
+			}
+			out << "\n";
+		}
+
+		out << "  ],\n";
+		out << "  \"memory_regions\": [\n";
+
+		MinidumpMemoryList *memoryList = loadedDump.minidump.GetMemoryList();
+		for (unsigned int i = 0; memoryList && i < memoryList->region_count(); ++i) {
+			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
+			out << "    {\"base\": " << region->GetBase() << ", \"size\": " << region->GetSize() << "}";
+			if (i + 1 < memoryList->region_count()) {
+				out << ",";
+			}
+			out << "\n";
+		}
+
+		out << "  ]\n";
+		out << "}\n";
+		return out.str();
+	}
+
+	std::string StripTrailingNewlinesCopy(const std::string &input)
+	{
+		std::string result = input;
+		while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+			result.pop_back();
+		}
+		return result;
+	}
+
+	std::string ExtractConsoleHistorySection(const std::string &metadata)
+	{
+		static const std::string beginMarker = "-------- CONSOLE HISTORY BEGIN --------\n";
+		static const std::string endMarker = "-------- CONSOLE HISTORY END --------";
+
+		size_t begin = metadata.find(beginMarker);
+		if (begin == std::string::npos) {
+			return "";
+		}
+		begin += beginMarker.size();
+
+		size_t end = metadata.find(endMarker, begin);
+		if (end == std::string::npos) {
+			end = metadata.size();
+		}
+
+		return StripTrailingNewlinesCopy(metadata.substr(begin, end - begin));
+	}
+
+	std::string StripConsoleHistorySection(const std::string &metadata)
+	{
+		static const std::string beginMarker = "-------- CONSOLE HISTORY BEGIN --------\n";
+		size_t begin = metadata.find(beginMarker);
+		if (begin == std::string::npos) {
+			return metadata;
+		}
+
+		return StripTrailingNewlinesCopy(metadata.substr(0, begin));
+	}
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump, bool includeConsoleHistory);
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump)
+	{
+		return BuildTraceReport(entry, loadedDump, true);
+	}
+
+	std::string BuildTraceReport(const PendingDumpEntry &entry, const LoadedDump &loadedDump, bool includeConsoleHistory)
+	{
+		std::ostringstream out;
+		out << RenderShortStackTrace(loadedDump.processState);
+		if (entry.hasMetadata) {
+			std::string metadata = ReadWholeFile(entry.metadataPath);
+			if (!metadata.empty()) {
+				std::string filteredMetadata = includeConsoleHistory ? metadata : StripConsoleHistorySection(metadata);
+				if (filteredMetadata.empty()) {
+					return out.str();
+				}
+				out << (includeConsoleHistory ? "\n-------- METADATA / CONSOLE --------\n" : "\n-------- METADATA --------\n");
+				out << filteredMetadata;
+				if (filteredMetadata.back() != '\n') {
+					out << "\n";
+				}
+			}
+		}
+		return out.str();
+	}
+
+	bool IsSupportedDumpMode(const std::string &mode)
+	{
+		return mode == "trace" || mode == "rawstack" || mode == "rawmemory" || mode == "rawraw" || mode == "all";
+	}
+
+	std::string ResolveOutputPath(const PendingDumpEntry &entry, const std::string &requestedOutput, const std::string &normalizedMode)
+	{
+		if (!requestedOutput.empty()) {
+			if (IsAbsolutePath(requestedOutput)) {
+				return requestedOutput;
+			}
+			return GetLocalOutputRoot() + "/" + requestedOutput;
+		}
+
+		return GetLocalOutputRoot() + "/" + normalizedMode + "_" + entry.name + ".txt";
+	}
+
+	bool BuildOutputForMode(const PendingDumpEntry &entry,
+		LoadedDump &loadedDump,
+		const std::string &normalizedMode,
+		std::string &output)
+	{
+		std::string carburetorRaw;
+		std::string carburetorError;
+		bool hasCarburetorRaw = false;
+		json carburetorDocument;
+		bool hasCarburetorJson = false;
+		if (normalizedMode == "rawstack" || normalizedMode == "rawmemory" || normalizedMode == "rawraw" || normalizedMode == "all") {
+			hasCarburetorRaw = TryRunCarburetorRaw(entry, carburetorRaw, carburetorError);
+			if (hasCarburetorRaw) {
+				hasCarburetorJson = ParseCarburetorJson(carburetorRaw, carburetorDocument, carburetorError);
+			}
+		}
+
+		if (normalizedMode == "trace") {
+			output = BuildTraceReport(entry, loadedDump);
+			return true;
+		}
+		if (normalizedMode == "rawstack") {
+			if (hasCarburetorJson) {
+				output = RenderCarburetorStack(carburetorDocument);
+			} else {
+				output = RenderVerboseStack(loadedDump);
+				if (!carburetorError.empty()) {
+					output = std::string("Carburetor unavailable, using built-in raw stack view.\nReason: ") + carburetorError + "\n\n" + output;
+				}
+			}
+			return true;
+		}
+		if (normalizedMode == "rawmemory") {
+			if (hasCarburetorJson) {
+				std::string memoryError;
+				output = RenderCarburetorMemory(carburetorDocument, memoryError);
+				if (output.empty()) {
+					output = RenderMemoryDump(loadedDump.minidump);
+					const std::string reason = !memoryError.empty() ? memoryError : carburetorError;
+					if (!reason.empty()) {
+						output = std::string("Carburetor unavailable, using built-in raw memory view.\nReason: ") + reason + "\n\n" + output;
+					}
+				}
+			} else {
+				output = RenderMemoryDump(loadedDump.minidump);
+				if (!carburetorError.empty()) {
+					output = std::string("Carburetor unavailable, using built-in raw memory view.\nReason: ") + carburetorError + "\n\n" + output;
+				}
+			}
+			return true;
+		}
+		if (normalizedMode == "rawraw") {
+			output = hasCarburetorRaw ? carburetorRaw : RenderRawJson(loadedDump);
+			if (!hasCarburetorRaw && !carburetorError.empty()) {
+				output = std::string("Carburetor unavailable, using built-in raw view.\nReason: ") + carburetorError + "\n\n" + output;
+			}
+			return true;
+		}
+		if (normalizedMode == "all") {
+			std::ostringstream out;
+			out << "======== TRACE ========\n" << BuildTraceReport(entry, loadedDump)
+				<< "\n======== RAWSTACK ========\n";
+			if (hasCarburetorJson) {
+				out << RenderCarburetorStack(carburetorDocument);
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw stack view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderVerboseStack(loadedDump);
+			}
+
+			out << "\n======== RAWMEMORY ========\n";
+			if (hasCarburetorJson) {
+				std::string memoryError;
+				std::string memoryOutput = RenderCarburetorMemory(carburetorDocument, memoryError);
+				if (!memoryOutput.empty()) {
+					out << memoryOutput;
+				} else {
+					if (!memoryError.empty()) {
+						out << "Carburetor unavailable, using built-in raw memory view.\nReason: " << memoryError << "\n\n";
+					}
+					out << RenderMemoryDump(loadedDump.minidump);
+				}
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw memory view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderMemoryDump(loadedDump.minidump);
+			}
+
+			out
+				<< "\n======== RAWRAW ========\n";
+			if (hasCarburetorRaw) {
+				out << carburetorRaw;
+			} else {
+				if (!carburetorError.empty()) {
+					out << "Carburetor unavailable, using built-in raw view.\nReason: " << carburetorError << "\n\n";
+				}
+				out << RenderRawJson(loadedDump);
+			}
+			output = out.str();
+			return true;
+		}
+		return false;
+	}
+}
+
+bool Accelerator_LocalListDumps(std::string &output, std::string &error)
+{
+	std::vector<PendingDumpEntry> entries;
+	if (!CollectPendingDumps(entries, &error)) {
+		return false;
+	}
+
+	std::ostringstream out;
+	if (entries.empty()) {
+		out << "No pending dump files were found.\n";
+		output = out.str();
+		return true;
+	}
+
+	out << "Found " << static_cast<unsigned>(entries.size()) << " pending dump(s):\n";
+	for (const PendingDumpEntry &entry : entries) {
+		out << "  " << entry.name << (entry.hasMetadata ? " [metadata]" : "") << "\n";
+	}
+	output = out.str();
+	return true;
+}
+
+bool Accelerator_LocalProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	std::string &outputPath,
+	std::string &status,
+	std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	std::string modeString = ToLowerCopy(mode ? mode : "");
+	std::string outputNameString = outputName ? outputName : "";
+
+	if (dumpNameString.empty() || !IsSupportedDumpMode(modeString)) {
+		error = "Invalid dump name or mode";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+
+	LoadedDump loadedDump(entry.dumpPath);
+	if (!LoadDump(loadedDump, error)) {
+		return false;
+	}
+
+	EnsureLocalSymbolsForDump(loadedDump);
+
+	std::string output;
+	if (!BuildOutputForMode(entry, loadedDump, modeString, output)) {
+		error = "Unsupported mode";
+		return false;
+	}
+
+	outputPath = ResolveOutputPath(entry, outputNameString, modeString);
+	std::string directoryError;
+	if (!EnsureDirectoryExists(std::filesystem::path(outputPath).parent_path().string(), directoryError)) {
+		error = directoryError;
+		return false;
+	}
+	if (!WriteWholeFile(outputPath, output, &error)) {
+		return false;
+	}
+
+	std::ostringstream out;
+	out << "Wrote " << modeString << " output for " << dumpNameString << " to " << outputPath;
+	status = out.str();
+	return true;
+}
+
+bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace, std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	if (dumpNameString.empty()) {
+		error = "Dump name is empty";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+
+	LoadedDump loadedDump(entry.dumpPath);
+	if (!LoadDump(loadedDump, error)) {
+		return false;
+	}
+
+	EnsureLocalSymbolsForDump(loadedDump);
+
+	stackTrace = BuildTraceReport(entry, loadedDump, false);
+	return true;
+}
+
+bool Accelerator_LocalGetConsoleDump(const char *dumpName, std::string &consoleDump, std::string &error)
+{
+	std::string dumpNameString = dumpName ? dumpName : "";
+	if (dumpNameString.empty()) {
+		error = "Dump name is empty";
+		return false;
+	}
+
+	PendingDumpEntry entry;
+	if (!FindPendingDumpByName(dumpNameString, entry, &error)) {
+		return false;
+	}
+	if (!entry.hasMetadata) {
+		error = "Dump metadata file was not found";
+		return false;
+	}
+
+	std::string metadata = ReadWholeFile(entry.metadataPath);
+	if (metadata.empty()) {
+		error = "Dump metadata file is empty";
+		return false;
+	}
+
+	consoleDump = ExtractConsoleHistorySection(metadata);
+	if (consoleDump.empty()) {
+		error = "Console history was not found in dump metadata";
+		return false;
+	}
+	return true;
+}
+
+void Accelerator_LocalTriggerCrashTest()
+{
+	AcceleratorConsoleWarning("Crash test command invoked. The server will now crash intentionally for Accelerator verification.");
+	fflush(stderr);
+
+#if defined _WINDOWS
+	RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+#else
+	volatile int *crash = nullptr;
+	*crash = 0xA11;
+#endif
 }
 
 struct UploadWatchdog
@@ -459,6 +2198,7 @@ class UploadThread: public IThread
 	char serverId[38] = "";
 
 	void RunThread(IThreadHandle *pHandle) {
+		const bool localMode = IsLocalMode();
 		log = fopen(logPath, "a");
 		if (!log) {
 			fprintf(stderr, "[Accelerator] Failed to open Accelerator log file: %s\n", logPath);
@@ -469,8 +2209,12 @@ class UploadThread: public IThread
 			fflush(log);
 		}
 
-		fprintf(stderr, "[Accelerator] Upload thread started. dump path: %s\n", dumpStoragePath);
+		fprintf(stderr, "[Accelerator] Upload thread started. dump path: %s%s\n", dumpStoragePath, localMode ? " (local mode)" : "");
 		fflush(stderr);
+		if (log) {
+			fprintf(log, "Mode: %s\n", localMode ? "local" : "site");
+			fflush(log);
+		}
 
 		char path[512];
 		g_pSM->Format(path, sizeof(path), "%s/server-id.txt", dumpStoragePath);
@@ -540,16 +2284,29 @@ class UploadThread: public IThread
 
 			if (!libsys->PathExists(metapath)) {
 				metapath[0] = '\0';
-				AcceleratorConsoleWarning("Crash dump metadata file is missing for %s; uploading minidump only", path);
+				AcceleratorConsoleWarning("Crash dump metadata file is missing for %s; proceeding without metadata", path);
 				if (log) {
-					fprintf(log, "Metadata file missing; uploading minidump only\n");
+					fprintf(log, "Metadata file missing\n");
 					fflush(log);
 				}
+			}
+
+			if (localMode) {
+				skip++;
+				fprintf(stderr, "[Accelerator] Local mode enabled. Skipping remote upload for dump: %s\n", path);
+				fflush(stderr);
+				if (log) {
+					fprintf(log, "Local mode: skipped remote upload for %s\n", path);
+					fflush(log);
+				}
+				dumps->NextEntry();
+				continue;
 			}
 
 			presubmitToken[0] = '\0';
 			PresubmitResponse presubmitResponse = kPRUploadCrashDumpAndMetadata;
 			bool deleteAfterProcessing = false;
+			const bool shouldDeleteProcessedDump = ShouldDeleteProcessedDump();
 
 			const char *presubmitOption = g_pSM->GetCoreConfigValue("MinidumpPresubmit");
 			bool canPresubmit = !presubmitOption || (tolower(presubmitOption[0]) == 'y' || presubmitOption[0] == '1');
@@ -573,7 +2330,7 @@ class UploadThread: public IThread
 				case kPRUploadMetadataOnly:
 					if (UploadCrashDump((presubmitResponse == kPRUploadMetadataOnly) ? nullptr : path, metapath, presubmitToken, response, sizeof(response))) {
 						count++;
-						deleteAfterProcessing = true;
+						deleteAfterProcessing = shouldDeleteProcessedDump;
 						fprintf(stderr, "[Accelerator] Uploaded crash dump: %s\n", response);
 						fflush(stderr);
 						if (log) {
@@ -594,7 +2351,7 @@ class UploadThread: public IThread
 					break;
 				case kPRDontUpload:
 					skip++;
-					deleteAfterProcessing = true;
+					deleteAfterProcessing = shouldDeleteProcessedDump;
 					fprintf(stderr, "[Accelerator] Crash dump upload skipped by server policy.\n");
 					fflush(stderr);
 					if (log) {
@@ -611,9 +2368,12 @@ class UploadThread: public IThread
 
 				unlink(path);
 			} else {
-				AcceleratorConsoleWarning("Keeping crash dump for retry: %s", path);
+				const char *keepReason = shouldDeleteProcessedDump
+					? "retry"
+					: "MinidumpDeleteAfterProcessing is disabled";
+				AcceleratorConsoleWarning("Keeping crash dump (%s): %s", keepReason, path);
 				if (log) {
-					fprintf(log, "Keeping crash dump for retry: %s\n", path);
+					fprintf(log, "Keeping crash dump (%s): %s\n", keepReason, path);
 					fflush(log);
 				}
 			}
@@ -1357,8 +3117,13 @@ Accelerator::Accelerator() :
 
 bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 {
-	sharesys->AddDependency(myself, "webternet.ext", true, true);
-	SM_GET_IFACE(WEBTERNET, webternet);
+	const bool localMode = IsLocalMode();
+	if (!localMode) {
+		sharesys->AddDependency(myself, "webternet.ext", true, true);
+		SM_GET_IFACE(WEBTERNET, webternet);
+	} else {
+		webternet = nullptr;
+	}
 
 	g_pSM->BuildPath(Path_SM, dumpStoragePath, sizeof(dumpStoragePath), "data/dumps");
 
@@ -1373,13 +3138,36 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	}
 
 	g_pSM->BuildPath(Path_SM, logPath, sizeof(logPath), "logs/accelerator.log");
+	AcceleratorConsoleWarning("Accelerator mode: %s", localMode ? "local" : "site");
+	if (localMode) {
+		const std::string carburetorPath = GetConfiguredCarburetorPath();
+		const std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+		const std::string joinedSymbolPaths = symbolPaths.empty() ? "(none)" : JoinStrings(symbolPaths, "; ");
+		std::string createError;
+		if (!EnsureDirectoryExists(GetLocalSymbolStoreRoot(), createError) && !createError.empty()) {
+			AcceleratorConsoleWarning("Failed to create local symbol store root: %s", createError.c_str());
+		}
+		createError.clear();
+		if (!EnsureDirectoryExists(GetLocalOutputRoot(), createError) && !createError.empty()) {
+			AcceleratorConsoleWarning("Failed to create local output root: %s", createError.c_str());
+		}
+		AcceleratorConsoleWarning("Local mode carburetor path: %s", carburetorPath.c_str());
+		AcceleratorConsoleWarning("Local mode symbol paths: %s", joinedSymbolPaths.c_str());
+		if (!PathExistsFile(carburetorPath)) {
+			AcceleratorConsoleWarning("Carburetor binary is missing. rawraw will fall back to built-in output until MinidumpLocalCarburetorPath is configured.");
+		}
+	}
 
 	// Get these early so the upload thread can use them.
 	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
 	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
 	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
 
-	threader->MakeThread(&uploadThread);
+	if (!localMode) {
+		threader->MakeThread(&uploadThread);
+	} else {
+		MarkAsDoneUploading();
+	}
 	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
 
 	do {

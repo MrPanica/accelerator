@@ -51,7 +51,7 @@ private:
 /**
  * @brief Sample implementation of the SDK Extension.
  */
-class Accelerator : public SDKExtension, IPluginsListener
+class Accelerator : public SDKExtension, public IPluginsListener
 {
 public: // SDKExtension
 	Accelerator();
@@ -137,5 +137,16 @@ private:
 
 // Expose the extension singleton.
 extern Accelerator g_accelerator;
+
+bool Accelerator_LocalListDumps(std::string &output, std::string &error);
+bool Accelerator_LocalProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	std::string &outputPath,
+	std::string &status,
+	std::string &error);
+bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace, std::string &error);
+bool Accelerator_LocalGetConsoleDump(const char *dumpName, std::string &consoleDump, std::string &error);
+void Accelerator_LocalTriggerCrashTest();
 
 #endif // _INCLUDE_SOURCEMOD_EXTENSION_PROPER_H_

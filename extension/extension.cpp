@@ -107,7 +107,9 @@ void operator delete[](void *ptr, size_t sz) {
 #include <google_breakpad/processor/call_stack.h>
 #include <google_breakpad/processor/stack_frame.h>
 #include <google_breakpad/processor/stack_frame_cpu.h>
+#include <google_breakpad/processor/basic_source_line_resolver.h>
 #include <processor/pathname_stripper.h>
+#include <processor/simple_symbol_supplier.h>
 
 #include <nlohmann/json.hpp>
 
@@ -203,6 +205,7 @@ static void AcceleratorConsoleWarning(const char *fmt, ...)
 namespace
 {
 	using nlohmann::json;
+	using google_breakpad::BasicSourceLineResolver;
 	using google_breakpad::CallStack;
 	using google_breakpad::MemoryRegion;
 	using google_breakpad::Minidump;
@@ -212,6 +215,7 @@ namespace
 	using google_breakpad::PathnameStripper;
 	using google_breakpad::ProcessResult;
 	using google_breakpad::ProcessState;
+	using google_breakpad::SimpleSymbolSupplier;
 	using google_breakpad::StackFrame;
 	using google_breakpad::StackFrameAMD64;
 	using google_breakpad::StackFrameX86;
@@ -1398,6 +1402,33 @@ namespace
 		return true;
 	}
 
+	bool ReloadDumpWithLocalSymbols(LoadedDump &loadedDump, std::string &error)
+	{
+		std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+		std::unique_ptr<SimpleSymbolSupplier> symbolSupplier;
+		if (!symbolPaths.empty()) {
+			symbolSupplier.reset(new SimpleSymbolSupplier(symbolPaths));
+		}
+
+		BasicSourceLineResolver resolver;
+		MinidumpProcessor processor(symbolSupplier.get(), &resolver);
+		loadedDump.processState = ProcessState();
+
+		ProcessResult result;
+		{
+			StderrInhibitor stderrInhibitor;
+			result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+		}
+		if (result != google_breakpad::PROCESS_OK) {
+			std::ostringstream out;
+			out << "Symbolized MinidumpProcessor failed with status " << result;
+			error = out.str();
+			return false;
+		}
+
+		return true;
+	}
+
 	const CallStack *GetRequestingThreadStack(const ProcessState &processState, int &threadIndex)
 	{
 		threadIndex = processState.requesting_thread();
@@ -1831,6 +1862,9 @@ bool Accelerator_LocalProcessDump(const char *dumpName,
 	}
 
 	EnsureLocalSymbolsForDump(loadedDump);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, error)) {
+		return false;
+	}
 
 	std::string output;
 	if (!BuildOutputForMode(entry, loadedDump, modeString, output)) {
@@ -1873,6 +1907,9 @@ bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace
 	}
 
 	EnsureLocalSymbolsForDump(loadedDump);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, error)) {
+		return false;
+	}
 
 	stackTrace = BuildTraceReport(entry, loadedDump, false);
 	return true;

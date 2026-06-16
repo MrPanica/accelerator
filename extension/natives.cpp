@@ -59,6 +59,23 @@ static cell_t Native_LocalListDumps(IPluginContext* context, const cell_t* param
 	return 1;
 }
 
+static cell_t Native_LocalListJobs(IPluginContext* context, const cell_t* params)
+{
+	char *buffer = nullptr;
+	context->LocalToString(params[1], &buffer);
+	size_t maxsize = static_cast<size_t>(params[2]);
+
+	std::string output;
+	std::string error;
+	if (!Accelerator_LocalListJobs(output, error)) {
+		context->ReportError("%s", error.c_str());
+		return 0;
+	}
+
+	ke::SafeStrcpy(buffer, maxsize, output.c_str());
+	return 1;
+}
+
 static cell_t Native_LocalProcessDump(IPluginContext* context, const cell_t* params)
 {
 	char *dumpName = nullptr;
@@ -89,6 +106,35 @@ static cell_t Native_LocalProcessDump(IPluginContext* context, const cell_t* par
 	return 1;
 }
 
+static cell_t Native_LocalStartProcessDump(IPluginContext* context, const cell_t* params)
+{
+	char *dumpName = nullptr;
+	char *mode = nullptr;
+	char *requestedOutput = nullptr;
+	char *status = nullptr;
+
+	context->LocalToString(params[1], &dumpName);
+	context->LocalToString(params[2], &mode);
+	context->LocalToString(params[3], &requestedOutput);
+	context->LocalToString(params[5], &status);
+
+	size_t statusLen = static_cast<size_t>(params[6]);
+
+	int jobId = 0;
+	std::string resolvedStatus;
+	std::string error;
+	if (!Accelerator_LocalStartProcessDump(dumpName, mode, requestedOutput, jobId, resolvedStatus, error)) {
+		context->ReportError("%s", error.c_str());
+		return 0;
+	}
+
+	cell_t *jobIdPtr = nullptr;
+	context->LocalToPhysAddr(params[4], &jobIdPtr);
+	*jobIdPtr = jobId;
+	ke::SafeStrcpy(status, statusLen, resolvedStatus.c_str());
+	return 1;
+}
+
 static cell_t Native_LocalGetStackDump(IPluginContext* context, const cell_t* params)
 {
 	char *dumpName = nullptr;
@@ -105,6 +151,29 @@ static cell_t Native_LocalGetStackDump(IPluginContext* context, const cell_t* pa
 	}
 
 	ke::SafeStrcpy(buffer, maxsize, stackTrace.c_str());
+	return 1;
+}
+
+static cell_t Native_LocalStartStackDump(IPluginContext* context, const cell_t* params)
+{
+	char *dumpName = nullptr;
+	char *status = nullptr;
+	context->LocalToString(params[1], &dumpName);
+	context->LocalToString(params[3], &status);
+	size_t statusLen = static_cast<size_t>(params[4]);
+
+	int jobId = 0;
+	std::string resolvedStatus;
+	std::string error;
+	if (!Accelerator_LocalStartStackDump(dumpName, jobId, resolvedStatus, error)) {
+		context->ReportError("%s", error.c_str());
+		return 0;
+	}
+
+	cell_t *jobIdPtr = nullptr;
+	context->LocalToPhysAddr(params[2], &jobIdPtr);
+	*jobIdPtr = jobId;
+	ke::SafeStrcpy(status, statusLen, resolvedStatus.c_str());
 	return 1;
 }
 
@@ -127,6 +196,52 @@ static cell_t Native_LocalGetConsoleDump(IPluginContext* context, const cell_t* 
 	return 1;
 }
 
+static cell_t Native_LocalGetJobStatus(IPluginContext* context, const cell_t* params)
+{
+	char *state = nullptr;
+	char *status = nullptr;
+	char *outputPath = nullptr;
+
+	context->LocalToString(params[2], &state);
+	context->LocalToString(params[4], &status);
+	context->LocalToString(params[6], &outputPath);
+
+	size_t stateLen = static_cast<size_t>(params[3]);
+	size_t statusLen = static_cast<size_t>(params[5]);
+	size_t outputPathLen = static_cast<size_t>(params[7]);
+
+	std::string resolvedState;
+	std::string resolvedStatus;
+	std::string resolvedOutputPath;
+	std::string error;
+	if (!Accelerator_LocalGetJobStatus(static_cast<int>(params[1]), resolvedState, resolvedStatus, resolvedOutputPath, error)) {
+		context->ReportError("%s", error.c_str());
+		return 0;
+	}
+
+	ke::SafeStrcpy(state, stateLen, resolvedState.c_str());
+	ke::SafeStrcpy(status, statusLen, resolvedStatus.c_str());
+	ke::SafeStrcpy(outputPath, outputPathLen, resolvedOutputPath.c_str());
+	return 1;
+}
+
+static cell_t Native_LocalGetJobResult(IPluginContext* context, const cell_t* params)
+{
+	char *buffer = nullptr;
+	context->LocalToString(params[2], &buffer);
+	size_t maxsize = static_cast<size_t>(params[3]);
+
+	std::string result;
+	std::string error;
+	if (!Accelerator_LocalGetJobResult(static_cast<int>(params[1]), result, error)) {
+		context->ReportError("%s", error.c_str());
+		return 0;
+	}
+
+	ke::SafeStrcpy(buffer, maxsize, result.c_str());
+	return 1;
+}
+
 static cell_t Native_LocalCrashTest(IPluginContext* context, const cell_t* params)
 {
 	Accelerator_LocalTriggerCrashTest();
@@ -140,9 +255,14 @@ void natives::Setup(std::vector<sp_nativeinfo_t>& vec)
 		{"Accelerator_IsDoneUploadingCrashes", Native_IsDoneUploadingCrashes},
 		{"Accelerator_GetCrashHTTPResponse", Native_GetCrashHTTPResponse},
 		{"Accelerator_LocalListDumps", Native_LocalListDumps},
+		{"Accelerator_LocalListJobs", Native_LocalListJobs},
 		{"Accelerator_LocalProcessDump", Native_LocalProcessDump},
+		{"Accelerator_LocalStartProcessDump", Native_LocalStartProcessDump},
 		{"Accelerator_LocalGetStackDump", Native_LocalGetStackDump},
+		{"Accelerator_LocalStartStackDump", Native_LocalStartStackDump},
 		{"Accelerator_LocalGetConsoleDump", Native_LocalGetConsoleDump},
+		{"Accelerator_LocalGetJobStatus", Native_LocalGetJobStatus},
+		{"Accelerator_LocalGetJobResult", Native_LocalGetJobResult},
 		{"Accelerator_LocalCrashTest", Native_LocalCrashTest},
 	};
 

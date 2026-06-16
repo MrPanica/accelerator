@@ -103,13 +103,34 @@ void operator delete[](void *ptr, size_t sz) {
 #define _STDINT // ~.~
 #include "client/windows/handler/exception_handler.h"
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #include <process.h>
 
 class StderrInhibitor
 {
+	int saved_stderr = -1;
+	int null_fd = -1;
+
 public:
-	StderrInhibitor() {}
-	~StderrInhibitor() {}
+	StderrInhibitor() {
+		saved_stderr = _dup(_fileno(stderr));
+		null_fd = _open("NUL", _O_WRONLY);
+		if (saved_stderr != -1 && null_fd != -1) {
+			_dup2(null_fd, _fileno(stderr));
+		}
+	}
+
+	~StderrInhibitor() {
+		fflush(stderr);
+		if (saved_stderr != -1) {
+			_dup2(saved_stderr, _fileno(stderr));
+			_close(saved_stderr);
+		}
+		if (null_fd != -1) {
+			_close(null_fd);
+		}
+	}
 };
 
 #else
@@ -137,8 +158,10 @@ public:
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -262,6 +285,45 @@ namespace
 	{
 		Site,
 		Local,
+	};
+
+	enum class LocalDumpJobState
+	{
+		Queued,
+		Running,
+		Done,
+		Failed,
+	};
+
+	struct LocalDumpSettings
+	{
+		std::string gamePath;
+		std::string sourceModPath;
+		std::string carburetorPath;
+		std::vector<std::string> symbolPaths;
+		std::string localSymbolStoreRoot;
+		std::string localOutputRoot;
+#if defined _WINDOWS
+		std::string dumpSymsPath;
+#endif
+	};
+
+	struct LocalDumpJob
+	{
+		int id = 0;
+		bool stackOnly = false;
+		std::string dumpName;
+		std::string mode;
+		std::string requestedOutputPath;
+		PendingDumpEntry entry;
+		LocalDumpSettings settings;
+		LocalDumpJobState state = LocalDumpJobState::Queued;
+		std::string status;
+		std::string outputPath;
+		std::string result;
+		std::string error;
+		std::chrono::system_clock::time_point createdAt;
+		std::chrono::system_clock::time_point finishedAt;
 	};
 
 	bool HasSuffix(const std::string &value, const char *suffix)
@@ -590,37 +652,86 @@ namespace
 
 	bool PathExistsFile(const std::string &path)
 	{
-		return libsys->PathExists(path.c_str());
+		std::error_code ec;
+		return std::filesystem::exists(std::filesystem::u8path(path), ec);
+	}
+
+	std::string NormalizePathString(const std::filesystem::path &path)
+	{
+		return path.lexically_normal().make_preferred().u8string();
+	}
+
+	bool StartsWithPathPrefix(const std::string &path, const char *prefix)
+	{
+		const size_t prefixLength = strlen(prefix);
+		if (path.size() < prefixLength) {
+			return false;
+		}
+		for (size_t i = 0; i < prefixLength; ++i) {
+			char left = static_cast<char>(std::tolower(static_cast<unsigned char>(path[i])));
+			char right = static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[i])));
+			if (left != right) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	std::string ResolveSourceModRelativePath(const std::string &configured,
+		const std::string &sourceModRoot,
+		const std::string &gameRoot)
+	{
+		if (configured.empty()) {
+			return "";
+		}
+		if (IsAbsolutePath(configured)) {
+			return NormalizePathString(std::filesystem::u8path(configured));
+		}
+
+		std::string normalized = configured;
+		std::replace(normalized.begin(), normalized.end(), '\\', '/');
+		if (StartsWithPathPrefix(normalized, "addons/sourcemod/")) {
+			return NormalizePathString(std::filesystem::u8path(gameRoot) / std::filesystem::u8path(normalized));
+		}
+		if (ToLowerCopy(normalized) == "addons/sourcemod") {
+			return NormalizePathString(std::filesystem::u8path(gameRoot) / "addons" / "sourcemod");
+		}
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / std::filesystem::u8path(normalized));
+	}
+
+	std::string GetDefaultCarburetorPath(const std::string &sourceModRoot)
+	{
+#if defined _WINDOWS
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / "bin" / (std::string(PLATFORM_ARCH_FOLDER) + "carburetor.exe"));
+#else
+		return NormalizePathString(std::filesystem::u8path(sourceModRoot) / "bin" / (std::string(PLATFORM_ARCH_FOLDER) + "carburetor"));
+#endif
 	}
 
 	std::string GetConfiguredCarburetorPath()
 	{
 		const char *configured = g_pSM->GetCoreConfigValue("MinidumpLocalCarburetorPath");
 		if (configured && configured[0]) {
-			if (IsAbsolutePath(configured)) {
-				return configured;
-			}
-			char resolved[PLATFORM_MAX_PATH];
-			g_pSM->BuildPath(Path_SM, resolved, sizeof(resolved), "%s", configured);
-			return resolved;
+			return ResolveSourceModRelativePath(configured, crashSourceModPath, crashGamePath);
 		}
+		return GetDefaultCarburetorPath(crashSourceModPath);
+	}
 
-#if defined _WINDOWS
-		char path[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/" PLATFORM_ARCH_FOLDER "carburetor.exe");
-		return path;
-#else
-		char path[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/" PLATFORM_ARCH_FOLDER "carburetor");
-		return path;
-#endif
+	std::string GetLocalSymbolStoreRoot()
+	{
+		return NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "data" / "dumps" / "symbols");
+	}
+
+	std::string GetLocalOutputRoot()
+	{
+		return NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "data" / "dumps" / "outputs");
 	}
 
 	std::vector<std::string> GetConfiguredLocalSymbolPaths()
 	{
 		std::vector<std::string> results;
 		auto appendIfUniqueExisting = [&](const std::string &path) {
-			if (path.empty() || (!PathExistsFile(path) && !libsys->IsPathDirectory(path.c_str()))) {
+			if (path.empty() || !PathExistsFile(path)) {
 				return;
 			}
 			if (std::find(results.begin(), results.end(), path) == results.end()) {
@@ -629,34 +740,12 @@ namespace
 		};
 
 		for (const std::string &item : SplitConfigPaths(g_pSM->GetCoreConfigValue("MinidumpLocalSymbolPath"))) {
-			if (IsAbsolutePath(item)) {
-				appendIfUniqueExisting(item);
-			} else {
-				char resolved[PLATFORM_MAX_PATH];
-				g_pSM->BuildPath(Path_SM, resolved, sizeof(resolved), "%s", item.c_str());
-				appendIfUniqueExisting(resolved);
-			}
+			appendIfUniqueExisting(ResolveSourceModRelativePath(item, crashSourceModPath, crashGamePath));
 		}
 
-		char dumpSymbols[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, dumpSymbols, sizeof(dumpSymbols), "data/dumps/symbols");
-		appendIfUniqueExisting(dumpSymbols);
+		appendIfUniqueExisting(GetLocalSymbolStoreRoot());
 
 		return results;
-	}
-
-	std::string GetLocalSymbolStoreRoot()
-	{
-		char dumpSymbols[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, dumpSymbols, sizeof(dumpSymbols), "data/dumps/symbols");
-		return dumpSymbols;
-	}
-
-	std::string GetLocalOutputRoot()
-	{
-		char outputRoot[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, outputRoot, sizeof(outputRoot), "data/dumps/outputs");
-		return outputRoot;
 	}
 
 	bool EnsureDirectoryExists(const std::string &path, std::string &error)
@@ -821,23 +910,24 @@ namespace
 #endif
 
 	#if defined _WINDOWS
-	std::string GetBundledDumpSymsPath()
+	std::string GetBundledDumpSymsPath(const LocalDumpSettings &settings)
 	{
-		char path[PLATFORM_MAX_PATH];
-		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/dump_syms.exe");
-		return path;
+		return settings.dumpSymsPath;
 	}
 	#endif
 
-	bool TryRunCarburetorRaw(const PendingDumpEntry &entry, std::string &output, std::string &error)
+	bool TryRunCarburetorRaw(const PendingDumpEntry &entry,
+		const LocalDumpSettings &settings,
+		std::string &output,
+		std::string &error)
 	{
-		std::string carburetorPath = GetConfiguredCarburetorPath();
+		const std::string &carburetorPath = settings.carburetorPath;
 		if (carburetorPath.empty() || !PathExistsFile(carburetorPath)) {
 			error = "Carburetor binary was not found. Configure MinidumpLocalCarburetorPath or place carburetor in addons/sourcemod/bin.";
 			return false;
 		}
 
-		std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+		const std::vector<std::string> &symbolPaths = settings.symbolPaths;
 		std::vector<std::string> arguments{carburetorPath, entry.dumpPath};
 		for (const std::string &symbolPath : symbolPaths) {
 			arguments.push_back(symbolPath);
@@ -936,7 +1026,10 @@ namespace
 #endif
 	}
 
-	bool GenerateLocalSymbolFile(const google_breakpad::CodeModule *module, std::string &storedPath, std::string &error)
+	bool GenerateLocalSymbolFile(const google_breakpad::CodeModule *module,
+		const LocalDumpSettings &settings,
+		std::string &storedPath,
+		std::string &error)
 	{
 		storedPath.clear();
 		if (!module) {
@@ -972,7 +1065,7 @@ namespace
 			return false;
 		}
 
-		const std::string storeRoot = GetLocalSymbolStoreRoot();
+		const std::string storeRoot = settings.localSymbolStoreRoot;
 		const std::string moduleDir = storeRoot + "/" + debugFileName + "/" + identifier;
 		if (!EnsureDirectoryExists(moduleDir, error)) {
 			return false;
@@ -996,7 +1089,7 @@ namespace
 			return false;
 		}
 
-		const std::string dumpSymsPath = GetBundledDumpSymsPath();
+		const std::string dumpSymsPath = GetBundledDumpSymsPath(settings);
 		if (dumpSymsPath.empty() || !PathExistsFile(dumpSymsPath)) {
 			error = "dump_syms.exe was not found in addons/sourcemod/bin";
 			return false;
@@ -1093,7 +1186,7 @@ namespace
 		return modulePaths;
 	}
 
-	void EnsureLocalSymbolsForDump(const LoadedDump &loadedDump)
+	void EnsureLocalSymbolsForDump(const LoadedDump &loadedDump, const LocalDumpSettings &settings)
 	{
 		const auto *modules = loadedDump.processState.modules();
 		if (!modules) {
@@ -1101,7 +1194,7 @@ namespace
 		}
 
 		std::string rootError;
-		if (!EnsureDirectoryExists(GetLocalSymbolStoreRoot(), rootError)) {
+		if (!EnsureDirectoryExists(settings.localSymbolStoreRoot, rootError)) {
 			AcceleratorConsoleWarning("Failed to create local symbol store: %s", rootError.c_str());
 			return;
 		}
@@ -1126,7 +1219,7 @@ namespace
 
 			std::string storedPath;
 			std::string error;
-			if (GenerateLocalSymbolFile(module, storedPath, error)) {
+			if (GenerateLocalSymbolFile(module, settings, storedPath, error)) {
 				generated++;
 			} else {
 #if defined _WINDOWS
@@ -1139,13 +1232,6 @@ namespace
 			}
 		}
 
-		if (failed > 0) {
-			AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, %u skipped/failed", generated, failed);
-		} else if (generated > 0) {
-			AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, 0 skipped/failed", generated);
-		} else if (hadVerboseFailure) {
-			AcceleratorConsoleWarning("Local symbol store update produced no usable symbols");
-		}
 	}
 
 	bool ParseCarburetorJson(const std::string &raw, json &document, std::string &error)
@@ -1711,9 +1797,10 @@ namespace
 		return true;
 	}
 
-	bool ReloadDumpWithLocalSymbols(LoadedDump &loadedDump, std::string &error)
+	bool ReloadDumpWithLocalSymbols(LoadedDump &loadedDump,
+		const std::vector<std::string> &symbolPaths,
+		std::string &error)
 	{
-		std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
 		std::unique_ptr<SimpleSymbolSupplier> symbolSupplier;
 		if (!symbolPaths.empty()) {
 			symbolSupplier.reset(new SimpleSymbolSupplier(symbolPaths));
@@ -2021,20 +2108,24 @@ namespace
 		return mode == "trace" || mode == "rawstack" || mode == "rawmemory" || mode == "rawraw" || mode == "all";
 	}
 
-	std::string ResolveOutputPath(const PendingDumpEntry &entry, const std::string &requestedOutput, const std::string &normalizedMode)
+	std::string ResolveOutputPath(const PendingDumpEntry &entry,
+		const std::string &requestedOutput,
+		const std::string &normalizedMode,
+		const std::string &outputRoot)
 	{
 		if (!requestedOutput.empty()) {
 			if (IsAbsolutePath(requestedOutput)) {
-				return requestedOutput;
+				return NormalizePathString(std::filesystem::u8path(requestedOutput));
 			}
-			return GetLocalOutputRoot() + "/" + requestedOutput;
+			return NormalizePathString(std::filesystem::u8path(outputRoot) / std::filesystem::u8path(requestedOutput));
 		}
 
-		return GetLocalOutputRoot() + "/" + normalizedMode + "_" + entry.name + ".txt";
+		return NormalizePathString(std::filesystem::u8path(outputRoot) / (normalizedMode + "_" + entry.name + ".txt"));
 	}
 
 	bool BuildOutputForMode(const PendingDumpEntry &entry,
 		LoadedDump &loadedDump,
+		const LocalDumpSettings &settings,
 		const std::string &normalizedMode,
 		std::string &output)
 	{
@@ -2044,7 +2135,7 @@ namespace
 		json carburetorDocument;
 		bool hasCarburetorJson = false;
 		if (normalizedMode == "rawstack" || normalizedMode == "rawmemory" || normalizedMode == "rawraw" || normalizedMode == "all") {
-			hasCarburetorRaw = TryRunCarburetorRaw(entry, carburetorRaw, carburetorError);
+			hasCarburetorRaw = TryRunCarburetorRaw(entry, settings, carburetorRaw, carburetorError);
 			if (hasCarburetorRaw) {
 				hasCarburetorJson = ParseCarburetorJson(carburetorRaw, carburetorDocument, carburetorError);
 			}
@@ -2138,6 +2229,26 @@ namespace
 		}
 		return false;
 	}
+
+	void LogMultilineResult(const char *header, const std::string &text)
+	{
+		if (header && header[0]) {
+			AcceleratorConsoleWarning("%s", header);
+		}
+
+		size_t start = 0;
+		while (start < text.size()) {
+			size_t end = text.find('\n', start);
+			std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (!line.empty()) {
+				AcceleratorConsoleWarning("%s", line.c_str());
+			}
+			if (end == std::string::npos) {
+				break;
+			}
+			start = end + 1;
+		}
+	}
 }
 
 bool Accelerator_LocalListDumps(std::string &output, std::string &error)
@@ -2157,6 +2268,262 @@ bool Accelerator_LocalListDumps(std::string &output, std::string &error)
 	out << "Found " << static_cast<unsigned>(entries.size()) << " pending dump(s):\n";
 	for (const PendingDumpEntry &entry : entries) {
 		out << "  " << entry.name << (entry.hasMetadata ? " [metadata]" : "") << "\n";
+	}
+	output = out.str();
+	return true;
+}
+
+namespace
+{
+	std::mutex localDumpJobMutex;
+	std::condition_variable localDumpJobCv;
+	std::map<int, std::shared_ptr<LocalDumpJob>> localDumpJobs;
+	std::deque<int> localDumpJobQueue;
+	std::thread localDumpWorkerThread;
+	std::atomic_bool localDumpWorkerStop{false};
+	int nextLocalDumpJobId = 1;
+	constexpr size_t kLocalDumpFinishedRetention = 32;
+
+	const char *LocalDumpJobStateName(LocalDumpJobState state)
+	{
+		switch (state) {
+			case LocalDumpJobState::Queued: return "queued";
+			case LocalDumpJobState::Running: return "running";
+			case LocalDumpJobState::Done: return "done";
+			case LocalDumpJobState::Failed: return "failed";
+		}
+		return "unknown";
+	}
+
+	LocalDumpSettings CollectCurrentLocalDumpSettings()
+	{
+		LocalDumpSettings settings;
+		settings.gamePath = crashGamePath;
+		settings.sourceModPath = crashSourceModPath;
+		settings.carburetorPath = GetConfiguredCarburetorPath();
+		settings.symbolPaths = GetConfiguredLocalSymbolPaths();
+		settings.localSymbolStoreRoot = GetLocalSymbolStoreRoot();
+		settings.localOutputRoot = GetLocalOutputRoot();
+#if defined _WINDOWS
+		settings.dumpSymsPath = NormalizePathString(std::filesystem::u8path(crashSourceModPath) / "bin" / "dump_syms.exe");
+#endif
+		return settings;
+	}
+
+	void TrimFinishedLocalDumpJobsLocked()
+	{
+		while (localDumpJobs.size() > kLocalDumpFinishedRetention) {
+			auto it = std::find_if(localDumpJobs.begin(), localDumpJobs.end(), [](const auto &entry) {
+				return entry.second->state == LocalDumpJobState::Done || entry.second->state == LocalDumpJobState::Failed;
+			});
+			if (it == localDumpJobs.end()) {
+				break;
+			}
+			localDumpJobs.erase(it);
+		}
+	}
+
+	bool BuildLocalDumpTask(LocalDumpJob &job, std::string &error)
+	{
+		if (job.dumpName.empty()) {
+			error = "Dump name is empty";
+			return false;
+		}
+		if (!job.stackOnly && !IsSupportedDumpMode(job.mode)) {
+			error = "Invalid dump mode";
+			return false;
+		}
+		if (!FindPendingDumpByName(job.dumpName, job.entry, &error)) {
+			return false;
+		}
+
+		job.settings = CollectCurrentLocalDumpSettings();
+		if (!job.stackOnly) {
+			job.outputPath = ResolveOutputPath(job.entry, job.requestedOutputPath, job.mode, job.settings.localOutputRoot);
+		}
+		return true;
+	}
+
+	bool ExecuteLocalDumpTask(LocalDumpJob &job, std::string &error)
+	{
+		LoadedDump loadedDump(job.entry.dumpPath);
+		if (!LoadDump(loadedDump, error)) {
+			return false;
+		}
+
+		EnsureLocalSymbolsForDump(loadedDump, job.settings);
+		if (!ReloadDumpWithLocalSymbols(loadedDump, job.settings.symbolPaths, error)) {
+			return false;
+		}
+
+		if (job.stackOnly) {
+			job.result = BuildTraceReport(job.entry, loadedDump, false);
+			std::ostringstream out;
+			out << "Built stack dump for " << job.dumpName;
+			job.status = out.str();
+			return true;
+		}
+
+		std::string output;
+		if (!BuildOutputForMode(job.entry, loadedDump, job.settings, job.mode, output)) {
+			error = "Unsupported mode";
+			return false;
+		}
+
+		std::string directoryError;
+		if (!EnsureDirectoryExists(std::filesystem::path(job.outputPath).parent_path().string(), directoryError)) {
+			error = directoryError;
+			return false;
+		}
+		if (!WriteWholeFile(job.outputPath, output, &error)) {
+			return false;
+		}
+
+		std::ostringstream out;
+		out << "Wrote " << job.mode << " output for " << job.dumpName << " to " << job.outputPath;
+		job.status = out.str();
+		job.result = job.status;
+		return true;
+	}
+
+	void LocalDumpWorkerLoop()
+	{
+		for (;;) {
+			std::shared_ptr<LocalDumpJob> job;
+			{
+				std::unique_lock<std::mutex> lock(localDumpJobMutex);
+				localDumpJobCv.wait(lock, []() {
+					return localDumpWorkerStop.load() || !localDumpJobQueue.empty();
+				});
+
+				if (localDumpWorkerStop.load() && localDumpJobQueue.empty()) {
+					return;
+				}
+
+				int jobId = localDumpJobQueue.front();
+				localDumpJobQueue.pop_front();
+
+				auto it = localDumpJobs.find(jobId);
+				if (it == localDumpJobs.end()) {
+					continue;
+				}
+
+				job = it->second;
+				job->state = LocalDumpJobState::Running;
+				job->status = "Job is running";
+			}
+
+			AcceleratorConsoleWarning("Local dump job #%d started: %s%s",
+				job->id,
+				job->dumpName.c_str(),
+				job->stackOnly ? " [stack]" : "");
+
+			std::string error;
+			const bool succeeded = ExecuteLocalDumpTask(*job, error);
+
+			{
+				std::lock_guard<std::mutex> lock(localDumpJobMutex);
+				job->finishedAt = std::chrono::system_clock::now();
+				if (succeeded) {
+					job->state = LocalDumpJobState::Done;
+				} else {
+					job->state = LocalDumpJobState::Failed;
+					job->error = error;
+					job->status = error;
+				}
+				TrimFinishedLocalDumpJobsLocked();
+			}
+
+			if (succeeded) {
+				AcceleratorConsoleWarning("Local dump job #%d finished: %s", job->id, job->status.c_str());
+				if (job->stackOnly) {
+					std::ostringstream header;
+					header << "Local dump job #" << job->id << " stack trace for " << job->dumpName << ":";
+					LogMultilineResult(header.str().c_str(), job->result);
+				} else {
+					AcceleratorConsoleWarning("Local dump job #%d result: %s", job->id, job->result.c_str());
+				}
+			} else {
+				AcceleratorConsoleWarning("Local dump job #%d failed: %s", job->id, error.c_str());
+			}
+		}
+	}
+
+	void StartLocalDumpWorker()
+	{
+		localDumpWorkerStop.store(false);
+		if (!localDumpWorkerThread.joinable()) {
+			localDumpWorkerThread = std::thread(LocalDumpWorkerLoop);
+		}
+	}
+
+	void StopLocalDumpWorker()
+	{
+		localDumpWorkerStop.store(true);
+		localDumpJobCv.notify_all();
+		if (localDumpWorkerThread.joinable()) {
+			localDumpWorkerThread.join();
+		}
+	}
+
+	bool EnqueueLocalDumpJob(std::shared_ptr<LocalDumpJob> job, int &jobId, std::string &status, std::string &error)
+	{
+		if (!job) {
+			error = "Job allocation failed";
+			return false;
+		}
+		if (!BuildLocalDumpTask(*job, error)) {
+			return false;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(localDumpJobMutex);
+			job->id = nextLocalDumpJobId++;
+			job->createdAt = std::chrono::system_clock::now();
+			job->state = LocalDumpJobState::Queued;
+			job->status = "Job is queued";
+			localDumpJobs[job->id] = job;
+			localDumpJobQueue.push_back(job->id);
+			AcceleratorConsoleWarning("Local dump job #%d queued: %s%s",
+				job->id,
+				job->dumpName.c_str(),
+				job->stackOnly ? " [stack]" : "");
+		}
+
+		localDumpJobCv.notify_one();
+
+		jobId = job->id;
+		std::ostringstream out;
+		out << "Started local dump job #" << jobId << " for " << job->dumpName;
+		status = out.str();
+		return true;
+	}
+}
+
+bool Accelerator_LocalListJobs(std::string &output, std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	std::ostringstream out;
+	if (localDumpJobs.empty()) {
+		out << "No local dump jobs exist.\n";
+		output = out.str();
+		return true;
+	}
+
+	out << "Found " << static_cast<unsigned>(localDumpJobs.size()) << " local dump job(s):\n";
+	for (const auto &entry : localDumpJobs) {
+		const LocalDumpJob &job = *entry.second;
+		out << "  #" << job.id << " [" << LocalDumpJobStateName(job.state) << "] "
+			<< job.dumpName;
+		if (!job.mode.empty()) {
+			out << " mode=" << job.mode;
+		} else if (job.stackOnly) {
+			out << " mode=stack";
+		}
+		if (!job.outputPath.empty()) {
+			out << " output=" << job.outputPath;
+		}
+		out << "\n";
 	}
 	output = out.str();
 	return true;
@@ -2188,18 +2555,19 @@ bool Accelerator_LocalProcessDump(const char *dumpName,
 		return false;
 	}
 
-	EnsureLocalSymbolsForDump(loadedDump);
-	if (!ReloadDumpWithLocalSymbols(loadedDump, error)) {
+	const LocalDumpSettings settings = CollectCurrentLocalDumpSettings();
+	EnsureLocalSymbolsForDump(loadedDump, settings);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, settings.symbolPaths, error)) {
 		return false;
 	}
 
 	std::string output;
-	if (!BuildOutputForMode(entry, loadedDump, modeString, output)) {
+	if (!BuildOutputForMode(entry, loadedDump, settings, modeString, output)) {
 		error = "Unsupported mode";
 		return false;
 	}
 
-	outputPath = ResolveOutputPath(entry, outputNameString, modeString);
+	outputPath = ResolveOutputPath(entry, outputNameString, modeString, settings.localOutputRoot);
 	std::string directoryError;
 	if (!EnsureDirectoryExists(std::filesystem::path(outputPath).parent_path().string(), directoryError)) {
 		error = directoryError;
@@ -2213,6 +2581,21 @@ bool Accelerator_LocalProcessDump(const char *dumpName,
 	out << "Wrote " << modeString << " output for " << dumpNameString << " to " << outputPath;
 	status = out.str();
 	return true;
+}
+
+bool Accelerator_LocalStartProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	int &jobId,
+	std::string &status,
+	std::string &error)
+{
+	auto job = std::make_shared<LocalDumpJob>();
+	job->dumpName = dumpName ? dumpName : "";
+	job->mode = ToLowerCopy(mode ? mode : "");
+	job->requestedOutputPath = outputName ? outputName : "";
+	job->stackOnly = false;
+	return EnqueueLocalDumpJob(job, jobId, status, error);
 }
 
 bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace, std::string &error)
@@ -2233,12 +2616,69 @@ bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace
 		return false;
 	}
 
-	EnsureLocalSymbolsForDump(loadedDump);
-	if (!ReloadDumpWithLocalSymbols(loadedDump, error)) {
+	const LocalDumpSettings settings = CollectCurrentLocalDumpSettings();
+	EnsureLocalSymbolsForDump(loadedDump, settings);
+	if (!ReloadDumpWithLocalSymbols(loadedDump, settings.symbolPaths, error)) {
 		return false;
 	}
 
 	stackTrace = BuildTraceReport(entry, loadedDump, false);
+	return true;
+}
+
+bool Accelerator_LocalStartStackDump(const char *dumpName, int &jobId, std::string &status, std::string &error)
+{
+	auto job = std::make_shared<LocalDumpJob>();
+	job->dumpName = dumpName ? dumpName : "";
+	job->stackOnly = true;
+	return EnqueueLocalDumpJob(job, jobId, status, error);
+}
+
+bool Accelerator_LocalGetJobStatus(int jobId,
+	std::string &state,
+	std::string &status,
+	std::string &outputPath,
+	std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	auto it = localDumpJobs.find(jobId);
+	if (it == localDumpJobs.end()) {
+		error = "Job not found";
+		return false;
+	}
+
+	const LocalDumpJob &job = *it->second;
+	state = LocalDumpJobStateName(job.state);
+	status = job.state == LocalDumpJobState::Failed ? job.error : job.status;
+	outputPath = job.outputPath;
+	return true;
+}
+
+bool Accelerator_LocalGetJobResult(int jobId, std::string &result, std::string &error)
+{
+	std::lock_guard<std::mutex> lock(localDumpJobMutex);
+	auto it = localDumpJobs.find(jobId);
+	if (it == localDumpJobs.end()) {
+		error = "Job not found";
+		return false;
+	}
+
+	const LocalDumpJob &job = *it->second;
+	if (job.state == LocalDumpJobState::Queued || job.state == LocalDumpJobState::Running) {
+		error = "Job is not finished yet";
+		return false;
+	}
+	if (job.state == LocalDumpJobState::Failed) {
+		error = job.error.empty() ? "Job failed" : job.error;
+		return false;
+	}
+	if (job.stackOnly) {
+		result = job.result;
+	} else {
+		std::ostringstream out;
+		out << job.status;
+		result = out.str();
+	}
 	return true;
 }
 
@@ -3494,6 +3934,12 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	}
 
 	g_pSM->BuildPath(Path_SM, logPath, sizeof(logPath), "logs/accelerator.log");
+
+	// Get these early so path resolution and background workers can use them safely.
+	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
+	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
+	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
+
 	AcceleratorConsoleWarning("Accelerator mode: %s", localMode ? "local" : "site");
 	if (localMode) {
 		const std::string carburetorPath = GetConfiguredCarburetorPath();
@@ -3514,15 +3960,11 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		}
 	}
 
-	// Get these early so the upload thread can use them.
-	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
-	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
-	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
-
 	if (!localMode) {
 		threader->MakeThread(&uploadThread);
 	} else {
 		MarkAsDoneUploading();
+		StartLocalDumpWorker();
 	}
 	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
 
@@ -3587,6 +4029,10 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 #error Bad platform.
 #endif
 
+	#if SMINTERFACE_EXTENSIONAPI_VERSION >= 9
+	strncpy(crashSourceModVersion, SM_FULL_VERSION, sizeof(crashSourceModVersion) - 1);
+	crashSourceModVersion[sizeof(crashSourceModVersion) - 1] = '\0';
+	#else
 	do {
 		char spJitPath[512];
 		g_pSM->BuildPath(Path_SM, spJitPath, sizeof(spJitPath), "bin/" PLATFORM_ARCH_FOLDER "sourcepawn.jit.x86." PLATFORM_LIB_EXT);
@@ -3624,6 +4070,7 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 		strncpy(crashSourceModVersion, spEngine2->GetVersionString(), sizeof(crashSourceModVersion));
 	} while(false);
+	#endif
 
 	plsys->AddPluginsListener(this);
 
@@ -3706,6 +4153,9 @@ void Accelerator::SDK_OnUnload()
 {
 	extforwards::Shutdown();
 	plsys->RemovePluginsListener(this);
+	if (IsLocalMode()) {
+		StopLocalDumpWorker();
+	}
 
 #if defined _LINUX
 	g_pSM->RemoveGameFrameHook(OnGameFrame);
@@ -3837,16 +4287,21 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 	size += sizeof(void *); // GetBaseContext
 	size += filenameSize;
 
-	uint32_t count = runtime->GetPublicsNum();
+	uint32_t count = 0;
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
+	count = runtime->GetPublicsNum();
+#endif
 	size += sizeof(uint32_t); // count
 	size += count * sizeof(uint32_t); // pubinfo->code_offs
 
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
 	for (uint32_t i = 0; i < count; ++i) {
 		sp_public_t *pubinfo;
 		runtime->GetPublicByIndex(i, &pubinfo);
 
 		size += strlen(pubinfo->name) + 1;
 	}
+#endif
 
 	unsigned char *buffer = (unsigned char *)malloc(size);
 	unsigned char *cursor = buffer;
@@ -3863,6 +4318,7 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 	memcpy(cursor, &count, sizeof(uint32_t));
 	cursor += sizeof(uint32_t);
 
+#if SMINTERFACE_EXTENSIONAPI_VERSION < 9
 	for (uint32_t i = 0; i < count; ++i) {
 		sp_public_t *pubinfo;
 		runtime->GetPublicByIndex(i, &pubinfo);
@@ -3874,6 +4330,7 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 		memcpy(cursor, pubinfo->name, nameSize);
 		cursor += nameSize;
 	}
+#endif
 
 	pluginContextMap[context] = buffer;
 

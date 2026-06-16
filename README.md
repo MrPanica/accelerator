@@ -134,13 +134,18 @@ Typical `core.cfg` keys for `local` mode:
 Optional `core.cfg` keys for local mode:
 
 ```cfg
+"MinidumpLocalCarburetorPath" "bin/x64/carburetor"
 "MinidumpLocalCarburetorPath" "addons/sourcemod/bin/x64/carburetor"
 ```
 
-Use `addons/sourcemod/bin/carburetor` instead on 32-bit servers, or point to any other absolute / game-relative path where your `carburetor` binary lives.
+Use `bin/carburetor` or `addons/sourcemod/bin/carburetor` instead on 32-bit Linux servers.
+Use `bin/carburetor.exe` or `addons/sourcemod/bin/carburetor.exe` on 32-bit Windows servers.
+Absolute paths are also accepted.
 
 On Windows, automatic local symbol generation also expects `dump_syms.exe` in the matching `addons/sourcemod/bin[/x64]` directory.
 Keep the matching `accelerator.ext.pdb` next to each `accelerator.ext.dll` if you want local stack traces to resolve Accelerator function names instead of only `module + offset`.
+
+The recommended local workflow is asynchronous. The plugin queues the heavy dump analysis work onto a background worker so normal use does not require `-nowatchdog`.
 
 ## Core Config Keys
 
@@ -176,15 +181,23 @@ These commands are provided by `accelerator_local.smx`:
 - `sm_dump_list`
   - lists pending local dumps
 - `sm_proc_stack_dump <dump>`
-  - prints the full trace plus metadata, without console history
+  - starts an asynchronous stack trace job
+  - prints the final stack trace automatically when the job finishes
 - `sm_proc_dump <dump> Trace [output-file]`
-  - writes the trace and metadata to a file
+  - starts an asynchronous dump processing job
+  - prints the final completion status automatically when the job finishes
 - `sm_proc_dump <dump> rawstack [output-file]`
 - `sm_proc_dump <dump> rawmemory [output-file]`
 - `sm_proc_dump <dump> rawraw [output-file]`
 - `sm_proc_dump <dump> all [output-file]`
 - `sm_proc_dump <dump> console`
   - prints only the captured console history
+- `sm_proc_jobs`
+  - lists processing jobs
+- `sm_proc_status <job-id>`
+  - shows job state and output path
+- `sm_proc_result <job-id>`
+  - optional manual fetch for the finished stack report or final file-processing status
 - `sm_dump_crash_test`
   - intentionally crashes the server so Accelerator can capture a test dump
 
@@ -194,9 +207,11 @@ If no output filename is provided, dump results are written to:
 addons/sourcemod/data/dumps/outputs/<mode>_<dump>.txt
 ```
 
+Legacy blocking natives and workflows still exist for compatibility. If you explicitly use the old synchronous path on Linux and the server spends too long in local analysis, `-nowatchdog` is still a valid fallback launch option.
+
 ## Building
 
-The default AMBuild path builds the `accelerator` extension. `carburetor` remains a separate project and is built through an offline overlay script for Windows.
+The default AMBuild path builds the `accelerator` extension. `carburetor` remains a separate project and is built separately.
 
 Requirements:
 
@@ -205,14 +220,31 @@ Requirements:
 - a SourceMod source checkout available via `--sm-path` or the `SOURCEMOD` environment variable
 - a working C/C++ toolchain for the requested targets
 
-Example:
+Typical native build:
 
 ```bash
-python configure.py --sm-path=/path/to/sourcemod
+python configure.py --sm-path=/path/to/sourcemod --targets=x86,x86_64
 ambuild
 ```
 
-By default the build attempts both `x86` and `x86_64` when supported by the local toolchain.
+The local command plugin can be rebuilt separately with `spcomp`:
+
+```bash
+spcomp scripting/accelerator_local.sp -i=scripting/include -o=accelerator_local.smx
+```
+
+Linux container build helper:
+
+```bash
+bash ./dockerbuild/accelerator_docker_build.sh
+```
+
+This produces Linux `x86` and `x86_64` extension binaries under `build/accelerator.ext/`.
+
+Windows native build helper:
+
+- run `configure.py` from a Visual Studio Developer PowerShell or another shell with a working MSVC toolchain
+- build both `x86` and `x86_64`
 
 Windows helper scripts:
 
@@ -231,10 +263,24 @@ Windows helper scripts:
 - extension binaries
 - `accelerator.autoload`
 - gamedata
-- `accelerator_local.smx` when a prebuilt plugin is present in `build/accelerator_local.smx`
-- SourcePawn include/example files
+- `accelerator_local.smx` when a prebuilt plugin is present
 
-Release archives built for deployment should additionally include:
+The ready-to-deploy runtime packages used in this repository are stored in `dist/`:
+
+- `dist/windows-sm112-api8`
+- `dist/linux`
+- `dist/accelerator-windows-sm112-api8.zip`
+- `dist/accelerator-linux.tar.gz`
+
+These `dist` packages are runtime-only and contain:
+
+- extension binaries
+- `accelerator.autoload`
+- gamedata
+- `accelerator_local.smx`
+- runtime helper binaries such as `carburetor`, `dump_syms.exe`, `msdia140.dll`, and Windows `.pdb` files where applicable
+
+If you package from raw `buildbot/PackageScript` output instead of the prepared `dist` directory, add:
 
 - Linux `carburetor` for `x86` and `x86_64`
 - Windows `carburetor.exe` for `x86` and `x86_64`

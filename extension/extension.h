@@ -139,12 +139,29 @@ private:
 extern Accelerator g_accelerator;
 
 bool Accelerator_LocalListDumps(std::string &output, std::string &error);
+bool Accelerator_LocalListJobs(std::string &output, std::string &error);
 bool Accelerator_LocalProcessDump(const char *dumpName,
 	const char *mode,
 	const char *outputName,
 	std::string &outputPath,
 	std::string &status,
 	std::string &error);
+bool Accelerator_LocalStartProcessDump(const char *dumpName,
+	const char *mode,
+	const char *outputName,
+	int &jobId,
+	std::string &status,
+	std::string &error);
+bool Accelerator_LocalStartStackDump(const char *dumpName,
+	int &jobId,
+	std::string &status,
+	std::string &error);
+bool Accelerator_LocalGetJobStatus(int jobId,
+	std::string &state,
+	std::string &status,
+	std::string &outputPath,
+	std::string &error);
+bool Accelerator_LocalGetJobResult(int jobId, std::string &result, std::string &error);
 bool Accelerator_LocalGetStackDump(const char *dumpName, std::string &stackTrace, std::string &error);
 bool Accelerator_LocalGetConsoleDump(const char *dumpName, std::string &consoleDump, std::string &error);
 void Accelerator_LocalTriggerCrashTest();

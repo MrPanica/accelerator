@@ -9,7 +9,7 @@ public Plugin myinfo =
 	name = "Accelerator Example",
 	author = "caxanga334",
 	description = "Example Accelerator natives plugin.",
-	version = "1.0.0",
+	version = "2.7.1",
 	url = "https://github.com/asherkin/accelerator"
 };
 

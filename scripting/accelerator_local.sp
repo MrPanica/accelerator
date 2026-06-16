@@ -9,7 +9,7 @@ public Plugin myinfo =
 	name = "Accelerator Local",
 	author = "OpenAI",
 	description = "Local dump console commands for Accelerator",
-	version = "1.0.0",
+	version = "2.7.1",
 	url = "https://github.com/asherkin/accelerator"
 };
 

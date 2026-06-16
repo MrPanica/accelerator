@@ -22,9 +22,9 @@
 
 #define SM_BUILD_TAG		"-manual"
 #define SM_BUILD_UNIQUEID	"[MANUAL BUILD]"
-#define SM_VERSION			"2.6.0"
+#define SM_VERSION			"2.7.1"
 #define SM_FULL_VERSION		SM_VERSION SM_BUILD_TAG
-#define SM_FILE_VERSION		2,6,0,0
+#define SM_FILE_VERSION		2,7,1,0
 
 #endif
 

@@ -29,9 +29,10 @@ libz.sources = AddSourceFilesFromDir(os.path.join(builder.currentSourcePath, 'zl
 ])
 
 for cxx in Accelerator.targets:
-  if cxx.target.platform == 'linux':
+  if cxx.target.platform in ['linux', 'windows']:
     binary = Accelerator.ConfigureLibrary(libz, cxx, builder)
-    binary.compiler.cflags += ['-Wno-implicit-function-declaration']
+    if cxx.target.platform == 'linux':
+      binary.compiler.cflags += ['-Wno-implicit-function-declaration']
 
 Accelerator.libz = builder.Add(libz)
 
@@ -155,9 +156,10 @@ for cxx in Accelerator.targets:
     # Wait for breakpad to be patched
     compiler.sourcedeps += Accelerator.breakpad_patch
 
-    if compiler.target.platform == 'linux':
-      # Link against our zlib if linux
+    if compiler.target.platform in ['linux', 'windows']:
+      # Link against our zlib for processor/symbol supplier support.
       Accelerator.link_libz(cxx, builder)
+    if compiler.target.platform == 'linux':
       binary.sources += linux_src
     if compiler.target.platform == 'windows':
       binary.sources += windows_src
@@ -167,6 +169,8 @@ for cxx in Accelerator.targets:
     ]
 
     compiler.defines += ['UNICODE']
+    if compiler.target.platform in ['linux', 'windows']:
+      compiler.defines += ['BPLOG_MINIMUM_SEVERITY=SEVERITY_ERROR']
 
 Accelerator.libbreakpad = builder.Add(libbreakpad)
 Accelerator.libbreakpad_client = builder.Add(libbreakpad_client)

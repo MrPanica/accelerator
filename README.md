@@ -23,10 +23,17 @@ This repository builds the `accelerator` extension itself. It does not vendor or
 ## Runtime Requirements
 
 - SourceMod 1.11+ or newer.
-- Linux server runtime for the provided `.so` binaries.
+- Supported runtime targets:
+  - Linux `x86` / `x86_64`
+  - Windows `x86` / `x86_64`
 - `carburetor` binary for local raw processing:
-  - `addons/sourcemod/bin/carburetor` for 32-bit servers
-  - `addons/sourcemod/bin/x64/carburetor` for 64-bit servers
+  - Linux `x86`: `addons/sourcemod/bin/carburetor`
+  - Linux `x86_64`: `addons/sourcemod/bin/x64/carburetor`
+  - Windows `x86`: `addons/sourcemod/bin/carburetor.exe`
+  - Windows `x86_64`: `addons/sourcemod/bin/x64/carburetor.exe`
+- Optional `dump_syms.exe` for automatic local symbol generation on Windows:
+  - Windows `x86`: `addons/sourcemod/bin/dump_syms.exe`
+  - Windows `x86_64`: `addons/sourcemod/bin/x64/dump_syms.exe`
 - Writable directories:
   - `addons/sourcemod/data/dumps`
   - `addons/sourcemod/data/dumps/symbols`
@@ -36,18 +43,32 @@ This repository builds the `accelerator` extension itself. It does not vendor or
 
 ## Server Installation
 
-Copy the runtime files to your game server like this:
+Copy the common runtime files to your game server:
 
-- `addons/sourcemod/extensions/accelerator.ext.so` - 32-bit Linux extension
-- `addons/sourcemod/extensions/x64/accelerator.ext.so` - 64-bit Linux extension
 - `addons/sourcemod/extensions/accelerator.autoload` - autoload marker
 - `addons/sourcemod/gamedata/accelerator.games.txt` - required gamedata
 - `addons/sourcemod/plugins/accelerator_local.smx` - local dump command plugin
 
-If you want local raw processing, also provide:
+Linux runtime files:
 
-- `addons/sourcemod/bin/carburetor` - 32-bit `carburetor`
-- `addons/sourcemod/bin/x64/carburetor` - 64-bit `carburetor`
+- `addons/sourcemod/extensions/accelerator.ext.so` - 32-bit Linux extension
+- `addons/sourcemod/extensions/x64/accelerator.ext.so` - 64-bit Linux extension
+- `addons/sourcemod/bin/carburetor` - 32-bit Linux `carburetor`
+- `addons/sourcemod/bin/x64/carburetor` - 64-bit Linux `carburetor`
+
+Windows runtime files:
+
+- `addons/sourcemod/extensions/accelerator.ext.dll` - 32-bit Windows extension
+- `addons/sourcemod/extensions/accelerator.ext.pdb` - 32-bit Windows symbols for local symbol generation
+- `addons/sourcemod/extensions/x64/accelerator.ext.dll` - 64-bit Windows extension
+- `addons/sourcemod/extensions/x64/accelerator.ext.pdb` - 64-bit Windows symbols for local symbol generation
+- `addons/sourcemod/bin/carburetor.exe` - 32-bit Windows `carburetor`
+- `addons/sourcemod/bin/x64/carburetor.exe` - 64-bit Windows `carburetor`
+
+Optional Windows symbol-generation helper:
+
+- `addons/sourcemod/bin/dump_syms.exe` - 32-bit Windows `dump_syms`
+- `addons/sourcemod/bin/x64/dump_syms.exe` - 64-bit Windows `dump_syms`
 
 The following directories should exist and be writable:
 
@@ -118,6 +139,9 @@ Optional `core.cfg` keys for local mode:
 
 Use `addons/sourcemod/bin/carburetor` instead on 32-bit servers, or point to any other absolute / game-relative path where your `carburetor` binary lives.
 
+On Windows, automatic local symbol generation also expects `dump_syms.exe` in the matching `addons/sourcemod/bin[/x64]` directory.
+Keep the matching `accelerator.ext.pdb` next to each `accelerator.ext.dll` if you want local stack traces to resolve Accelerator function names instead of only `module + offset`.
+
 ## Core Config Keys
 
 - `MinidumpMode`
@@ -172,7 +196,7 @@ addons/sourcemod/data/dumps/outputs/<mode>_<dump>.txt
 
 ## Building
 
-This project builds the extension only. It does not build `carburetor`.
+The default AMBuild path builds the `accelerator` extension. `carburetor` remains a separate project and is built through an offline overlay script for Windows.
 
 Requirements:
 
@@ -190,6 +214,16 @@ ambuild
 
 By default the build attempts both `x86` and `x86_64` when supported by the local toolchain.
 
+Windows helper scripts:
+
+- `buildbot/build_windows_accelerator.ps1`
+  - builds `accelerator` with AMBuild from a Visual Studio Developer PowerShell
+- `buildbot/build_windows_carburetor.ps1`
+  - stages a local copy of the sibling `carburetor` repository
+  - copies locally cached `breakpad`, `distorm`, `json`, and `cppcodec`
+  - applies the local Breakpad patch set in the staging directory
+  - configures and builds `carburetor.exe` for `x86` or `x64`
+
 ## Packaging
 
 `buildbot/PackageScript` packages Accelerator runtime files only:
@@ -197,13 +231,22 @@ By default the build attempts both `x86` and `x86_64` when supported by the loca
 - extension binaries
 - `accelerator.autoload`
 - gamedata
+- `accelerator_local.smx` when a prebuilt plugin is present in `build/accelerator_local.smx`
 - SourcePawn include/example files
 
-External runtime dependencies such as `carburetor` are expected to be copied into the final release artifact separately.
+Release archives built for deployment should additionally include:
+
+- Linux `carburetor` for `x86` and `x86_64`
+- Windows `carburetor.exe` for `x86` and `x86_64`
+- Windows `dump_syms.exe` for `x86` and `x86_64`
+- Windows `msdia140.dll` for `x86` and `x86_64`
+- Windows `accelerator.ext.pdb` for `x86` and `x86_64`
 
 ## Notes About Carburetor
 
 Accelerator uses `carburetor` as an external companion tool for local raw dump processing. The binary is not modified by Accelerator at runtime. Accelerator simply resolves the path, executes it, passes symbol paths, and consumes the resulting output.
+
+On Windows, local symbol generation is done by invoking an external `dump_syms.exe` helper if it is present in the architecture-matching `addons/sourcemod/bin` directory.
 
 ## License
 

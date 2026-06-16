@@ -1,0 +1,133 @@
+cmake_minimum_required(VERSION 3.16)
+project(carburetor LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS UNICODE)
+endif()
+
+set(BREAKPAD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/breakpad")
+set(DISTORM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/distorm")
+set(JSON_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/json")
+set(CPPCODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/cppcodec")
+set(ZLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/zlib")
+
+file(GLOB DISTORM_SOURCES "${DISTORM_ROOT}/src/*.c")
+
+add_library(distorm STATIC ${DISTORM_SOURCES})
+target_include_directories(distorm PUBLIC
+  "${DISTORM_ROOT}/include"
+  "${DISTORM_ROOT}/src"
+)
+
+add_library(zlib STATIC
+  "${ZLIB_ROOT}/adler32.c"
+  "${ZLIB_ROOT}/compress.c"
+  "${ZLIB_ROOT}/crc32.c"
+  "${ZLIB_ROOT}/deflate.c"
+  "${ZLIB_ROOT}/gzclose.c"
+  "${ZLIB_ROOT}/gzlib.c"
+  "${ZLIB_ROOT}/gzread.c"
+  "${ZLIB_ROOT}/gzwrite.c"
+  "${ZLIB_ROOT}/infback.c"
+  "${ZLIB_ROOT}/inffast.c"
+  "${ZLIB_ROOT}/inflate.c"
+  "${ZLIB_ROOT}/inftrees.c"
+  "${ZLIB_ROOT}/trees.c"
+  "${ZLIB_ROOT}/uncompr.c"
+  "${ZLIB_ROOT}/zutil.c"
+)
+target_include_directories(zlib PUBLIC "${ZLIB_ROOT}")
+
+add_library(libdisasm STATIC
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_implicit.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_insn.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_invariant.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_modrm.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_opcode_tables.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_operand.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_reg.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/ia32_settings.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_disasm.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_format.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_imm.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_insn.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_misc.c"
+  "${BREAKPAD_ROOT}/src/third_party/libdisasm/x86_operand_list.c"
+)
+target_include_directories(libdisasm PUBLIC "${BREAKPAD_ROOT}/src")
+
+add_library(breakpad STATIC
+  "${BREAKPAD_ROOT}/src/common/convert_UTF.cc"
+  "${BREAKPAD_ROOT}/src/common/string_conversion.cc"
+  "${BREAKPAD_ROOT}/src/common/windows/guid_string.cc"
+  "${BREAKPAD_ROOT}/src/common/windows/string_utils.cc"
+  "${BREAKPAD_ROOT}/src/processor/basic_code_modules.cc"
+  "${BREAKPAD_ROOT}/src/processor/basic_source_line_resolver.cc"
+  "${BREAKPAD_ROOT}/src/processor/call_stack.cc"
+  "${BREAKPAD_ROOT}/src/processor/cfi_frame_info.cc"
+  "${BREAKPAD_ROOT}/src/processor/convert_old_arm64_context.cc"
+  "${BREAKPAD_ROOT}/src/processor/disassembler_x86.cc"
+  "${BREAKPAD_ROOT}/src/processor/dump_context.cc"
+  "${BREAKPAD_ROOT}/src/processor/dump_object.cc"
+  "${BREAKPAD_ROOT}/src/processor/exploitability.cc"
+  "${BREAKPAD_ROOT}/src/processor/exploitability_linux.cc"
+  "${BREAKPAD_ROOT}/src/processor/exploitability_win.cc"
+  "${BREAKPAD_ROOT}/src/processor/fast_source_line_resolver.cc"
+  "${BREAKPAD_ROOT}/src/processor/logging.cc"
+  "${BREAKPAD_ROOT}/src/processor/microdump.cc"
+  "${BREAKPAD_ROOT}/src/processor/microdump_processor.cc"
+  "${BREAKPAD_ROOT}/src/processor/minidump.cc"
+  "${BREAKPAD_ROOT}/src/processor/minidump_processor.cc"
+  "${BREAKPAD_ROOT}/src/processor/module_comparer.cc"
+  "${BREAKPAD_ROOT}/src/processor/module_serializer.cc"
+  "${BREAKPAD_ROOT}/src/processor/pathname_stripper.cc"
+  "${BREAKPAD_ROOT}/src/processor/process_state.cc"
+  "${BREAKPAD_ROOT}/src/processor/proc_maps_linux.cc"
+  "${BREAKPAD_ROOT}/src/processor/simple_symbol_supplier.cc"
+  "${BREAKPAD_ROOT}/src/processor/source_line_resolver_base.cc"
+  "${BREAKPAD_ROOT}/src/processor/stack_frame_cpu.cc"
+  "${BREAKPAD_ROOT}/src/processor/stack_frame_symbolizer.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalk_common.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_amd64.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_arm.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_arm64.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_address_list.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_mips.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_ppc.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_ppc64.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_sparc.cc"
+  "${BREAKPAD_ROOT}/src/processor/stackwalker_x86.cc"
+  "${BREAKPAD_ROOT}/src/processor/symbolic_constants_win.cc"
+  "${BREAKPAD_ROOT}/src/processor/tokenize.cc"
+)
+target_include_directories(breakpad PUBLIC "${BREAKPAD_ROOT}/src")
+target_link_libraries(breakpad PRIVATE zlib libdisasm)
+
+add_executable(carburetor
+  "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/compressed_symbol_supplier.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/repo_source_line_resolver.cc"
+)
+
+target_include_directories(carburetor PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${BREAKPAD_ROOT}/src"
+  "${DISTORM_ROOT}/include"
+  "${JSON_ROOT}"
+  "${CPPCODEC_ROOT}/cppcodec"
+  "${ZLIB_ROOT}"
+)
+
+target_link_libraries(carburetor PRIVATE breakpad libdisasm distorm zlib)
+
+if(MSVC)
+  target_compile_definitions(carburetor PRIVATE
+    gzclose_r=gzclose
+  )
+  target_compile_options(carburetor PRIVATE /FIio.h)
+endif()

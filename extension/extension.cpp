@@ -94,8 +94,23 @@ void operator delete[](void *ptr, size_t sz) {
 }
 
 #elif defined _WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #define _STDINT // ~.~
 #include "client/windows/handler/exception_handler.h"
+#include <windows.h>
+#include <process.h>
+
+class StderrInhibitor
+{
+public:
+	StderrInhibitor() {}
+	~StderrInhibitor() {}
+};
 
 #else
 #error Bad platform.
@@ -462,6 +477,8 @@ namespace
 		return out.str();
 	}
 
+	std::string StripLeadingNonJson(const std::string &raw);
+
 	std::string EscapeJson(const std::string &input)
 	{
 		std::ostringstream out;
@@ -487,10 +504,17 @@ namespace
 
 	std::string QuoteCommandArg(const std::string &value)
 	{
+#if defined _WINDOWS
+		std::string normalized = value;
+		std::replace(normalized.begin(), normalized.end(), '/', '\\');
+#else
+		const std::string &normalized = value;
+#endif
+
 		std::string escaped;
-		escaped.reserve(value.size() + 2);
+		escaped.reserve(normalized.size() + 2);
 		escaped.push_back('"');
-		for (char ch : value) {
+		for (char ch : normalized) {
 			if (ch == '"') {
 				escaped += "\\\"";
 			} else {
@@ -500,6 +524,69 @@ namespace
 		escaped.push_back('"');
 		return escaped;
 	}
+
+#if defined _WINDOWS
+	std::wstring Utf8ToWide(const std::string &value)
+	{
+		if (value.empty()) {
+			return std::wstring();
+		}
+
+		int required = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+		if (required <= 0) {
+			return std::wstring();
+		}
+
+		std::vector<wchar_t> buffer(static_cast<size_t>(required), L'\0');
+		if (MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, buffer.data(), required) <= 0) {
+			return std::wstring();
+		}
+
+		return std::wstring(buffer.data());
+	}
+
+	std::string WideToUtf8(const std::wstring &value)
+	{
+		if (value.empty()) {
+			return std::string();
+		}
+
+		int required = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		if (required <= 0) {
+			return std::string();
+		}
+
+		std::vector<char> buffer(static_cast<size_t>(required), '\0');
+		if (WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, buffer.data(), required, nullptr, nullptr) <= 0) {
+			return std::string();
+		}
+
+		return std::string(buffer.data());
+	}
+
+	std::wstring GetDirectoryName(const std::wstring &path)
+	{
+		size_t slash = path.find_last_of(L"\\/");
+		if (slash == std::wstring::npos) {
+			return std::wstring();
+		}
+
+		return path.substr(0, slash);
+	}
+
+	std::wstring BuildWindowsCommandLine(const std::vector<std::string> &arguments)
+	{
+		std::ostringstream out;
+		for (size_t i = 0; i < arguments.size(); ++i) {
+			if (i != 0) {
+				out << ' ';
+			}
+			out << QuoteCommandArg(arguments[i]);
+		}
+		return Utf8ToWide(out.str());
+	}
+
+#endif
 
 	bool PathExistsFile(const std::string &path)
 	{
@@ -513,7 +600,9 @@ namespace
 			if (IsAbsolutePath(configured)) {
 				return configured;
 			}
-			return std::string(dumpStoragePath) + "/" + configured;
+			char resolved[PLATFORM_MAX_PATH];
+			g_pSM->BuildPath(Path_SM, resolved, sizeof(resolved), "%s", configured);
+			return resolved;
 		}
 
 #if defined _WINDOWS
@@ -587,7 +676,8 @@ namespace
 		exitCode = -1;
 
 #if defined _WINDOWS
-		FILE *pipe = _popen(commandLine.c_str(), "r");
+		std::string wrappedCommand = commandLine + " 2>&1";
+		FILE *pipe = _popen(wrappedCommand.c_str(), "r");
 #else
 		FILE *pipe = popen((commandLine + " 2>&1").c_str(), "r");
 #endif
@@ -613,6 +703,132 @@ namespace
 		return true;
 	}
 
+#if defined _WINDOWS
+	bool RunProcessCapture(const std::vector<std::string> &arguments,
+		std::string &stdoutOutput,
+		std::string &stderrOutput,
+		int &exitCode,
+		std::string &error)
+	{
+		stdoutOutput.clear();
+		stderrOutput.clear();
+		exitCode = -1;
+
+		if (arguments.empty()) {
+			error = "No command arguments were provided";
+			return false;
+		}
+
+		std::wstring application = Utf8ToWide(arguments[0]);
+		if (application.empty()) {
+			error = "Failed to convert executable path to UTF-16";
+			return false;
+		}
+
+		std::wstring commandLine = BuildWindowsCommandLine(arguments);
+		if (commandLine.empty()) {
+			error = "Failed to build command line";
+			return false;
+		}
+
+		SECURITY_ATTRIBUTES securityAttributes{};
+		securityAttributes.nLength = sizeof(securityAttributes);
+		securityAttributes.bInheritHandle = TRUE;
+
+		HANDLE outputReadPipe = nullptr;
+		HANDLE outputWritePipe = nullptr;
+		if (!CreatePipe(&outputReadPipe, &outputWritePipe, &securityAttributes, 0)) {
+			error = "CreatePipe failed";
+			return false;
+		}
+
+		if (!SetHandleInformation(outputReadPipe, HANDLE_FLAG_INHERIT, 0)) {
+			CloseHandle(outputReadPipe);
+			CloseHandle(outputWritePipe);
+			error = "SetHandleInformation failed";
+			return false;
+		}
+
+		STARTUPINFOW startupInfo{};
+		startupInfo.cb = sizeof(startupInfo);
+		startupInfo.dwFlags = STARTF_USESTDHANDLES;
+		startupInfo.hStdInput = nullptr;
+		startupInfo.hStdOutput = outputWritePipe;
+		startupInfo.hStdError = outputWritePipe;
+
+		PROCESS_INFORMATION processInfo{};
+		std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+		mutableCommandLine.push_back(L'\0');
+		std::wstring workingDirectory = GetDirectoryName(application);
+
+		BOOL created = CreateProcessW(
+			application.c_str(),
+			mutableCommandLine.data(),
+			nullptr,
+			nullptr,
+			TRUE,
+			CREATE_NO_WINDOW,
+			nullptr,
+			workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+			&startupInfo,
+			&processInfo
+		);
+
+		CloseHandle(outputWritePipe);
+
+		if (!created) {
+			DWORD lastError = GetLastError();
+			CloseHandle(outputReadPipe);
+
+			LPWSTR messageBuffer = nullptr;
+			FormatMessageW(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+				nullptr,
+				lastError,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				reinterpret_cast<LPWSTR>(&messageBuffer),
+				0,
+				nullptr
+			);
+
+			std::wstring wideError = messageBuffer ? messageBuffer : L"CreateProcessW failed";
+			if (messageBuffer) {
+				LocalFree(messageBuffer);
+			}
+
+			error = WideToUtf8(wideError);
+			return false;
+		}
+
+		char buffer[4096];
+		DWORD bytesRead = 0;
+		while (ReadFile(outputReadPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead != 0) {
+			stdoutOutput.append(buffer, buffer + bytesRead);
+		}
+		CloseHandle(outputReadPipe);
+
+		WaitForSingleObject(processInfo.hProcess, INFINITE);
+		DWORD processExitCode = 0;
+		if (GetExitCodeProcess(processInfo.hProcess, &processExitCode)) {
+			exitCode = static_cast<int>(processExitCode);
+		}
+
+		CloseHandle(processInfo.hThread);
+		CloseHandle(processInfo.hProcess);
+
+		return true;
+	}
+#endif
+
+	#if defined _WINDOWS
+	std::string GetBundledDumpSymsPath()
+	{
+		char path[PLATFORM_MAX_PATH];
+		g_pSM->BuildPath(Path_SM, path, sizeof(path), "bin/dump_syms.exe");
+		return path;
+	}
+	#endif
+
 	bool TryRunCarburetorRaw(const PendingDumpEntry &entry, std::string &output, std::string &error)
 	{
 		std::string carburetorPath = GetConfiguredCarburetorPath();
@@ -622,17 +838,32 @@ namespace
 		}
 
 		std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
+		std::vector<std::string> arguments{carburetorPath, entry.dumpPath};
+		for (const std::string &symbolPath : symbolPaths) {
+			arguments.push_back(symbolPath);
+		}
 
+		int exitCode = -1;
+#if defined _WINDOWS
+		std::string stderrOutput;
+		if (!RunProcessCapture(arguments, output, stderrOutput, exitCode, error)) {
+			return false;
+		}
+		output = StripLeadingNonJson(output);
+		if (output.empty() && !stderrOutput.empty()) {
+			error = stderrOutput;
+			return false;
+		}
+#else
 		std::ostringstream commandLine;
 		commandLine << QuoteCommandArg(carburetorPath) << " " << QuoteCommandArg(entry.dumpPath);
 		for (const std::string &symbolPath : symbolPaths) {
 			commandLine << " " << QuoteCommandArg(symbolPath);
 		}
-
-		int exitCode = -1;
 		if (!RunCommandCapture(commandLine.str(), output, exitCode, error)) {
 			return false;
 		}
+#endif
 		if (exitCode != 0) {
 			std::ostringstream out;
 			out << "Carburetor exited with code " << exitCode;
@@ -655,13 +886,37 @@ namespace
 		return debugFileName + ".sym";
 	}
 
+#if defined _WINDOWS
+	const char *kMissingAdjacentPdb = "No adjacent PDB found";
+
+	std::string GetAdjacentPdbPath(const std::string &modulePath)
+	{
+		if (modulePath.empty()) {
+			return "";
+		}
+
+		size_t slash = modulePath.find_last_of("/\\");
+		size_t dot = modulePath.find_last_of('.');
+		if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+			return modulePath + ".pdb";
+		}
+		return modulePath.substr(0, dot) + ".pdb";
+	}
+#endif
+
 	bool LooksLikeSymbolizableModulePath(const std::string &path)
 	{
-		if (path.empty() || path[0] != '/') {
+		if (path.empty() || !IsAbsolutePath(path)) {
 			return false;
 		}
 
 		const std::string lowered = ToLowerCopy(path);
+#if defined _WINDOWS
+		if (HasSuffix(lowered, ".dll") || HasSuffix(lowered, ".exe") || HasSuffix(lowered, ".pdb")) {
+			return true;
+		}
+		return false;
+#else
 		if (lowered.find("/dev/shm/") == 0) {
 			return false;
 		}
@@ -678,14 +933,11 @@ namespace
 			return true;
 		}
 		return false;
+#endif
 	}
 
 	bool GenerateLocalSymbolFile(const google_breakpad::CodeModule *module, std::string &storedPath, std::string &error)
 	{
-#if !defined _LINUX
-		error = "Automatic local symbol generation is only implemented for Linux";
-		return false;
-#else
 		storedPath.clear();
 		if (!module) {
 			error = "Module is null";
@@ -693,10 +945,10 @@ namespace
 		}
 
 		std::string debugFile = module->debug_file();
-		if (debugFile.empty() || debugFile[0] != '/') {
+		if (debugFile.empty() || !IsAbsolutePath(debugFile)) {
 			debugFile = module->code_file();
 		}
-		if (debugFile.empty() || debugFile[0] != '/') {
+		if (debugFile.empty() || !IsAbsolutePath(debugFile)) {
 			error = "Module path is not absolute";
 			return false;
 		}
@@ -731,6 +983,55 @@ namespace
 			return true;
 		}
 
+#if defined _WINDOWS
+		const std::string moduleBinary = module->code_file();
+		if (moduleBinary.empty() || !IsAbsolutePath(moduleBinary)) {
+			error = "Module binary path is not absolute";
+			return false;
+		}
+
+		const std::string pdbPath = GetAdjacentPdbPath(moduleBinary);
+		if (pdbPath.empty() || !PathExistsFile(pdbPath)) {
+			error = kMissingAdjacentPdb;
+			return false;
+		}
+
+		const std::string dumpSymsPath = GetBundledDumpSymsPath();
+		if (dumpSymsPath.empty() || !PathExistsFile(dumpSymsPath)) {
+			error = "dump_syms.exe was not found in addons/sourcemod/bin";
+			return false;
+		}
+
+		std::string outputText;
+		std::string errorText;
+		int exitCode = -1;
+		if (!RunProcessCapture({dumpSymsPath, debugFile}, outputText, errorText, exitCode, error)) {
+			return false;
+		}
+		if (exitCode != 0) {
+			std::ostringstream out;
+			out << "dump_syms.exe exited with code " << exitCode;
+			if (!errorText.empty()) {
+				out << ": " << errorText;
+			} else if (!outputText.empty()) {
+				out << ": " << outputText;
+			}
+			error = out.str();
+			return false;
+		}
+		if (outputText.empty()) {
+			error = "dump_syms.exe returned an empty symbol file";
+			return false;
+		}
+
+		std::string writeError;
+		if (!WriteWholeFile(storedPath, outputText, &writeError)) {
+			error = writeError;
+			return false;
+		}
+
+		return true;
+#else
 		auto debugFileDir = google_breakpad::DirName(debugFile);
 		std::vector<std::string> debugDirs{
 			debugFileDir,
@@ -781,7 +1082,7 @@ namespace
 			}
 
 			std::string path = frame->module->debug_file();
-			if (path.empty() || path[0] != '/') {
+			if (path.empty() || !IsAbsolutePath(path)) {
 				path = frame->module->code_file();
 			}
 			if (LooksLikeSymbolizableModulePath(path)) {
@@ -807,6 +1108,7 @@ namespace
 
 		unsigned int generated = 0;
 		unsigned int failed = 0;
+		bool hadVerboseFailure = false;
 		std::set<std::string> requestedPaths = CollectRequestingThreadModulePaths(loadedDump);
 		for (unsigned int i = 0; i < modules->module_count(); ++i) {
 			const google_breakpad::CodeModule *module = modules->GetModuleAtIndex(i);
@@ -815,7 +1117,7 @@ namespace
 			}
 
 			std::string modulePath = module->debug_file();
-			if (modulePath.empty() || modulePath[0] != '/') {
+			if (modulePath.empty() || !IsAbsolutePath(modulePath)) {
 				modulePath = module->code_file();
 			}
 			if (!requestedPaths.empty() && requestedPaths.find(modulePath) == requestedPaths.end()) {
@@ -827,21 +1129,29 @@ namespace
 			if (GenerateLocalSymbolFile(module, storedPath, error)) {
 				generated++;
 			} else {
-				failed++;
-				if (!error.empty()) {
-					AcceleratorConsoleWarning("Local symbol generation skipped for %s: %s",
-						module ? module->code_file().c_str() : "(null)", error.c_str());
+#if defined _WINDOWS
+				if (error == kMissingAdjacentPdb) {
+					continue;
 				}
+#endif
+				failed++;
+				hadVerboseFailure = hadVerboseFailure || !error.empty();
 			}
 		}
 
-		AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, %u skipped/failed", generated, failed);
+		if (failed > 0) {
+			AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, %u skipped/failed", generated, failed);
+		} else if (generated > 0) {
+			AcceleratorConsoleWarning("Local symbol store updated: %u module(s) ready, 0 skipped/failed", generated);
+		} else if (hadVerboseFailure) {
+			AcceleratorConsoleWarning("Local symbol store update produced no usable symbols");
+		}
 	}
 
 	bool ParseCarburetorJson(const std::string &raw, json &document, std::string &error)
 	{
 		try {
-			document = json::parse(raw);
+			document = json::parse(StripLeadingNonJson(raw));
 			if (!document.is_object()) {
 				error = "Carburetor did not return a JSON object";
 				return false;
@@ -945,7 +1255,7 @@ namespace
 					continue;
 				}
 				const std::string hex = JsonString(instructions[i].value("hex", json()));
-				bytesPerLine = std::max(bytesPerLine, hex.size() / 2);
+				bytesPerLine = (std::max)(bytesPerLine, hex.size() / 2);
 			}
 		}
 
@@ -969,7 +1279,7 @@ namespace
 				if (index > 0) {
 					hexFormatted << ' ';
 				}
-				hexFormatted << hex.substr(index, std::min<size_t>(2, hex.size() - index));
+				hexFormatted << hex.substr(index, (std::min<size_t>)(2, hex.size() - index));
 			}
 
 			out << line << std::hex << std::setw(8) << std::setfill('0') << offset << std::dec << std::setfill(' ')
@@ -1021,7 +1331,7 @@ namespace
 
 		size_t width = 8;
 		for (const auto &entry : registers) {
-			width = std::max(width, HexWidthForAddress(entry.second));
+			width = (std::max)(width, HexWidthForAddress(entry.second));
 		}
 
 		std::ostringstream out;
@@ -1073,7 +1383,7 @@ namespace
 		out << "Thread " << requestingThread << " (crashed):\n";
 
 		const size_t numFrames = thread.size();
-		const size_t frameDigits = std::max<size_t>(1, std::to_string(numFrames > 0 ? numFrames - 1 : 0).size());
+		const size_t frameDigits = (std::max<size_t>)(1, std::to_string(numFrames > 0 ? numFrames - 1 : 0).size());
 
 		for (size_t i = 0; i < numFrames; ++i) {
 			const json &frame = thread[i];
@@ -1302,7 +1612,7 @@ namespace
 			size_t count = 0;
 			size_t registerWidth = 8;
 			for (const auto &entry : registers) {
-				registerWidth = std::max(registerWidth, HexWidthForAddress(entry.second));
+				registerWidth = (std::max)(registerWidth, HexWidthForAddress(entry.second));
 			}
 			out << indent;
 			for (const auto &entry : registers) {
@@ -1381,22 +1691,21 @@ namespace
 
 	bool LoadDump(LoadedDump &loadedDump, std::string &error)
 	{
-		if (!loadedDump.minidump.Read()) {
-			error = "Minidump could not be read";
-			return false;
-		}
-
-		MinidumpProcessor processor(nullptr, nullptr);
-		ProcessResult result;
 		{
 			StderrInhibitor stderrInhibitor;
-			result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
-		}
-		if (result != google_breakpad::PROCESS_OK) {
-			std::ostringstream out;
-			out << "MinidumpProcessor failed with status " << result;
-			error = out.str();
-			return false;
+			if (!loadedDump.minidump.Read()) {
+				error = "Minidump could not be read";
+				return false;
+			}
+
+			MinidumpProcessor processor(nullptr, nullptr);
+			ProcessResult result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+			if (result != google_breakpad::PROCESS_OK) {
+				std::ostringstream out;
+				out << "MinidumpProcessor failed with status " << result;
+				error = out.str();
+				return false;
+			}
 		}
 
 		return true;
@@ -1414,18 +1723,16 @@ namespace
 		MinidumpProcessor processor(symbolSupplier.get(), &resolver);
 		loadedDump.processState = ProcessState();
 
-		ProcessResult result;
 		{
 			StderrInhibitor stderrInhibitor;
-			result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+			ProcessResult result = processor.Process(&loadedDump.minidump, &loadedDump.processState);
+			if (result != google_breakpad::PROCESS_OK) {
+				std::ostringstream out;
+				out << "Symbolized MinidumpProcessor failed with status " << result;
+				error = out.str();
+				return false;
+			}
 		}
-		if (result != google_breakpad::PROCESS_OK) {
-			std::ostringstream out;
-			out << "Symbolized MinidumpProcessor failed with status " << result;
-			error = out.str();
-			return false;
-		}
-
 		return true;
 	}
 
@@ -1524,13 +1831,13 @@ namespace
 			return out.str();
 		}
 
-		uint64_t start = std::numeric_limits<uint64_t>::max();
+		uint64_t start = (std::numeric_limits<uint64_t>::max)();
 		uint64_t end = 0;
 		uint64_t totalBytes = 0;
 		for (unsigned int i = 0; i < memoryList->region_count(); ++i) {
 			MinidumpMemoryRegion *region = memoryList->GetMemoryRegionAtIndex(i);
-			start = std::min(start, region->GetBase());
-			end = std::max(end, region->GetBase() + region->GetSize());
+			start = (std::min)(start, region->GetBase());
+			end = (std::max)(end, region->GetBase() + region->GetSize());
 			totalBytes += region->GetSize();
 		}
 
@@ -1629,6 +1936,26 @@ namespace
 			result.pop_back();
 		}
 		return result;
+	}
+
+	std::string StripLeadingNonJson(const std::string &raw)
+	{
+		size_t objectPos = raw.find('{');
+		size_t arrayPos = raw.find('[');
+		size_t jsonPos = std::string::npos;
+		if (objectPos != std::string::npos && arrayPos != std::string::npos) {
+			jsonPos = (std::min)(objectPos, arrayPos);
+		} else if (objectPos != std::string::npos) {
+			jsonPos = objectPos;
+		} else {
+			jsonPos = arrayPos;
+		}
+
+		if (jsonPos == std::string::npos) {
+			return raw;
+		}
+
+		return raw.substr(jsonPos);
 	}
 
 	std::string ExtractConsoleHistorySection(const std::string &metadata)
@@ -2491,7 +2818,7 @@ class UploadThread: public IThread
 			}
 		}
 
-		if (debugFile[0] != '/') {
+		if (!IsAbsolutePath(debugFile)) {
 			return false;
 		}
 
@@ -2582,11 +2909,7 @@ class UploadThread: public IThread
 	bool UploadModuleFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
-		if (codeFile[0] != '/') {
-#else
-		if (codeFile[1] != ':') {
-#endif
+		if (!IsAbsolutePath(codeFile)) {
 			return false;
 		}
 
@@ -2712,15 +3035,11 @@ class UploadThread: public IThread
 
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
 		if (codeFile == "linux-gate.so") {
 			return kMTSystem;
 		}
 
-		if (codeFile[0] != '/') {
-#else
-		if (codeFile[1] != ':') {
-#endif
+		if (!IsAbsolutePath(codeFile)) {
 			return kMTUnknown;
 		}
 

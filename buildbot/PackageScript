@@ -12,6 +12,7 @@ folder_list = [
   'addons/sourcemod/gamedata',
   'addons/sourcemod/configs',
   'addons/sourcemod/bin',
+  'addons/sourcemod/plugins',
   'addons/sourcemod/scripting',
   'addons/sourcemod/scripting/include',
 ]
@@ -60,6 +61,10 @@ CopyFiles('scripting', 'addons/sourcemod/scripting',
     'accelerator_example.sp',
   ]
 )
+
+plugin_binary = os.path.join(builder.sourcePath, 'build', 'accelerator_local.smx')
+if os.path.isfile(plugin_binary):
+  builder.AddCopy(plugin_binary, folder_map['addons/sourcemod/plugins'])
 
 # Copy binaries.
 for task in Accelerator.extension:

@@ -19,28 +19,29 @@ void ReplyMultiline(int client, const char[] prefix, const char[] text)
 
 	int length = strlen(text);
 	int start = 0;
+
 	while (start < length)
 	{
 		char chunk[900];
-		strcopy(chunk, sizeof(chunk), text[start]);
+		int write = 0;
 
-		int newline = FindCharInString(chunk, '\n');
-		if (newline != -1)
+		while (start < length && write < sizeof(chunk) - 1)
 		{
-			chunk[newline] = '\0';
+			char c = text[start++];
+			if (c == '\n')
+			{
+				break;
+			}
+
+			chunk[write++] = c;
 		}
+
+		chunk[write] = '\0';
 
 		if (chunk[0] != '\0')
 		{
 			ReplyToCommand(client, "%s", chunk);
 		}
-
-		if (newline == -1)
-		{
-			break;
-		}
-
-		start += newline + 1;
 	}
 }
 

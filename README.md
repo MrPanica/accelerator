@@ -22,7 +22,9 @@ This repository builds the `accelerator` extension itself. It does not vendor or
 
 ## Runtime Requirements
 
-- SourceMod 1.11+ or newer.
+- SourceMod package compatibility:
+  - API8 builds: SourceMod `1.12.x`
+  - API9 builds: SourceMod `1.13.0.7354+`
 - Supported runtime targets:
   - Linux `x86` / `x86_64`
   - Windows `x86` / `x86_64`
@@ -93,6 +95,7 @@ Typical `core.cfg` keys for `site` mode:
 
 ```cfg
 "MinidumpMode" "site"
+"MinidumpDebug" "no"
 "MinidumpDeleteAfterProcessing" "1"
 "MinidumpAccount" "7656119..."
 "MinidumpPresubmit" "yes"
@@ -110,6 +113,7 @@ Notes:
 - `MinidumpAccount` should be the Steam account used for dump ownership / attribution.
 - `MinidumpSymbolUpload` controls how aggressively symbols are uploaded in remote mode.
 - `MinidumpPresubmit`, `MinidumpUrl`, `MinidumpSymbolUrl`, and `MinidumpBinaryUrl` are only meaningful in `site` mode.
+- `MinidumpDebug "yes"` enables verbose diagnostics in `addons/sourcemod/logs/accelerator.log`.
 
 ### Local Mode
 
@@ -127,6 +131,7 @@ Typical `core.cfg` keys for `local` mode:
 
 ```cfg
 "MinidumpMode" "local"
+"MinidumpDebug" "no"
 "MinidumpDeleteAfterProcessing" "0"
 "MinidumpLocalSymbolPath" "addons/sourcemod/data/dumps/symbols"
 ```
@@ -147,6 +152,48 @@ Keep the matching `accelerator.ext.pdb` next to each `accelerator.ext.dll` if yo
 
 The recommended local workflow is asynchronous. The plugin queues the heavy dump analysis work onto a background worker so normal use does not require `-nowatchdog`.
 
+### Debug Logging
+
+`MinidumpDebug` controls how noisy `addons/sourcemod/logs/accelerator.log` is.
+
+- `MinidumpDebug "no"` or unset:
+  - minimal operational log
+  - no routine `Accelerator mode: local|site` line in `accelerator.log`
+  - no idle `No pending crash dumps found`
+  - no path banners such as `Local mode carburetor path`
+  - no detailed presubmit / symbol / binary upload trace
+- `MinidumpDebug "yes"`:
+  - enables detailed diagnostics
+  - includes mode line, path banners, upload thread start lines, presubmit details, and symbol/binary upload trace
+
+Every line written to `accelerator.log` is timestamped in local server time.
+The mode line is still printed to the server console in both modes; `MinidumpDebug` only controls whether that routine line is also mirrored into `accelerator.log`.
+
+Example `local + debug`:
+
+```cfg
+"MinidumpMode" "local"
+"MinidumpDebug" "yes"
+"MinidumpDeleteAfterProcessing" "0"
+"MinidumpLocalSymbolPath" "addons/sourcemod/data/dumps/symbols"
+"MinidumpLocalCarburetorPath" "addons/sourcemod/bin/x64/carburetor"
+```
+
+Example `site + debug`:
+
+```cfg
+"MinidumpMode" "site"
+"MinidumpDebug" "yes"
+"MinidumpDeleteAfterProcessing" "1"
+"MinidumpAccount" "7656119..."
+"MinidumpPresubmit" "yes"
+"MinidumpSymbolUpload" "3"
+"MinidumpBinaryUpload" "yes"
+"MinidumpUrl" "http://example.com/submit?token=YOUR_TOKEN"
+"MinidumpSymbolUrl" "http://example.com/symbols/submit?token=YOUR_TOKEN"
+"MinidumpBinaryUrl" "http://example.com/binary/submit?token=YOUR_TOKEN"
+```
+
 ## Core Config Keys
 
 - `MinidumpMode`
@@ -157,6 +204,9 @@ The recommended local workflow is asynchronous. The plugin queues the heavy dump
 - `MinidumpDeleteAfterProcessing`
   - `1` by default
   - `0` / `no` / `n` keeps dumps after successful processing
+- `MinidumpDebug`
+  - `no` by default
+  - `yes` enables verbose diagnostics in `accelerator.log`
 - `MinidumpPresubmit`
   - enables the remote presubmit flow in `site` mode
 - `MinidumpSymbolUpload`
@@ -213,19 +263,19 @@ Legacy blocking natives and workflows still exist for compatibility. If you expl
 
 The default AMBuild path builds the `accelerator` extension. `carburetor` remains a separate project and is built separately.
 
+Build/package matrix:
+
+- Windows API8: SourceMod `1.12.x`, `x86` + `x86_64`
+- Linux API8: SourceMod `1.12.x`, `x86` + `x86_64`
+- Windows API9: SourceMod `1.13.0.7354+`, `x86` + `x86_64`
+- Linux API9: SourceMod `1.13.0.7354+`, `x86` + `x86_64`
+
 Requirements:
 
 - Python
-- `ambuild2`
 - a SourceMod source checkout available via `--sm-path` or the `SOURCEMOD` environment variable
-- a working C/C++ toolchain for the requested targets
-
-Typical native build:
-
-```bash
-python configure.py --sm-path=/path/to/sourcemod --targets=x86,x86_64
-ambuild
-```
+- `ambuild2` and a working C/C++ toolchain for the requested targets
+- Docker only if you want to use the optional containerized Linux helper flow
 
 The local command plugin can be rebuilt separately with `spcomp`:
 
@@ -233,18 +283,73 @@ The local command plugin can be rebuilt separately with `spcomp`:
 spcomp scripting/accelerator_local.sp -i=scripting/include -o=accelerator_local.smx
 ```
 
-Linux container build helper:
+Linux native build:
+
+```bash
+python configure.py --sm-path=/path/to/sourcemod --targets=x86,x86_64
+ambuild
+```
+
+Optional containerized Linux helper flow:
+
+```bash
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_builder.ps1
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_accelerator.ps1 -SourceModPath /path/to/sourcemod
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_accelerator.ps1 -SourceModPath /path/to/sourcemod-api9 -BuildDir build/linux-accelerator-api9
+```
+
+This flow:
+
+- runs entirely inside the Docker image `accelerator-linux-builder:bullseye`
+- stages the Linux build in a separate working directory
+- keeps Linux build products out of the main repository tree
+
+Linux `carburetor` helper:
+
+```bash
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_carburetor.ps1 -CarburetorRoot /path/to/carburetor -Arch x86 -BuildDir build-linux-carburetor-x86
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_carburetor.ps1 -CarburetorRoot /path/to/carburetor -Arch x64 -BuildDir build-linux-carburetor-x64
+```
+
+The helper scripts use the local Docker image `accelerator-linux-builder:bullseye` so the Linux toolchain is installed once at image-build time, not on every build run.
+
+Optional staging override for the containerized helper flow:
+
+```bash
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_accelerator.ps1 -SourceModPath /path/to/sourcemod -StageRoot /path/to/linux-stage
+powershell -ExecutionPolicy Bypass -File buildbot/build_linux_carburetor.ps1 -Arch x64 -StageRoot /path/to/linux-stage
+```
+
+Legacy Linux helper:
 
 ```bash
 bash ./dockerbuild/accelerator_docker_build.sh
 ```
 
-This produces Linux `x86` and `x86_64` extension binaries under `build/accelerator.ext/`.
+Keep it only for compatibility. The `buildbot/*.ps1` helper path is the maintained one.
 
 Windows native build helper:
 
 - run `configure.py` from a Visual Studio Developer PowerShell or another shell with a working MSVC toolchain
-- build both `x86` and `x86_64`
+- build `x86` and `x86_64` in separate developer shells
+  - `x86`: `VsDevCmd.bat -arch=x86`
+  - `x86_64`: `VsDevCmd.bat -arch=amd64`
+
+Windows helper scripts:
+
+```bat
+:: accelerator API8
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_accelerator.ps1 -SourceModPath C:\path\to\sourcemod -BuildDir build\win-accelerator-api8-x86 -Targets x86
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_accelerator.ps1 -SourceModPath C:\path\to\sourcemod -BuildDir build\win-accelerator-api8-x64 -Targets x86_64
+
+:: accelerator API9
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_accelerator.ps1 -SourceModPath C:\path\to\sourcemod-api9 -BuildDir build\win-accelerator-api9-x86 -Targets x86
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_accelerator.ps1 -SourceModPath C:\path\to\sourcemod-api9 -BuildDir build\win-accelerator-api9-x64 -Targets x86_64
+
+:: carburetor
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_carburetor.ps1 -CarburetorRoot C:\path\to\carburetor -Arch x86 -BuildDir build\win-carburetor-x86
+powershell -ExecutionPolicy Bypass -File buildbot\build_windows_carburetor.ps1 -CarburetorRoot C:\path\to\carburetor -Arch x64 -BuildDir build\win-carburetor-x64
+```
 
 Windows helper scripts:
 
@@ -268,9 +373,13 @@ Windows helper scripts:
 The ready-to-deploy runtime packages used in this repository are stored in `dist/`:
 
 - `dist/windows-sm112-api8`
-- `dist/linux`
+- `dist/windows-sm113.0.7354-api9`
+- `dist/linux-sm112-api8`
+- `dist/linux-sm113.0.7354-api9`
 - `dist/accelerator-windows-sm112-api8.zip`
-- `dist/accelerator-linux.tar.gz`
+- `dist/accelerator-windows-sm113.0.7354-api9.zip`
+- `dist/accelerator-linux-sm112-api8.tar.gz`
+- `dist/accelerator-linux-sm113.0.7354-api9.tar.gz`
 
 These `dist` packages are runtime-only and contain:
 

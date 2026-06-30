@@ -166,6 +166,7 @@ public:
 #include <map>
 #include <mutex>
 #include <cstdarg>
+#include <ctime>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -202,6 +203,34 @@ char logPath[512];
 
 google_breakpad::ExceptionHandler *handler = NULL;
 static std::mutex acceleratorLogMutex;
+static std::atomic<bool> acceleratorDebugLoggingEnabled{false};
+static std::atomic<bool> acceleratorBackgroundThreadsStarted{false};
+
+std::string ToLowerCopy(const std::string &value)
+{
+	std::string lowered(value);
+	std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return lowered;
+}
+
+static bool IsTruthyCoreConfigValue(const char *key, bool defaultValue)
+{
+	const char *raw = g_pSM->GetCoreConfigValue(key);
+	if (!raw || !raw[0]) {
+		return defaultValue;
+	}
+
+	std::string lowered = ToLowerCopy(raw);
+	if (lowered == "1" || lowered == "y" || lowered == "yes" || lowered == "true" || lowered == "on") {
+		return true;
+	}
+	if (lowered == "0" || lowered == "n" || lowered == "no" || lowered == "false" || lowered == "off") {
+		return false;
+	}
+	return defaultValue;
+}
 
 static std::string RedactUrlForLog(const char *url)
 {
@@ -219,25 +248,86 @@ static std::string RedactUrlForLog(const char *url)
 	return safeUrl;
 }
 
-static void AcceleratorConsoleWarning(const char *fmt, ...)
+static std::tm GetLocalLogTimestamp(std::time_t rawTime)
+{
+	std::tm localTime{};
+#if defined _WINDOWS
+	localtime_s(&localTime, &rawTime);
+#else
+	localtime_r(&rawTime, &localTime);
+#endif
+	return localTime;
+}
+
+static void AcceleratorWriteLogLine(const char *message)
+{
+	std::lock_guard<std::mutex> lock(acceleratorLogMutex);
+	FILE *log = fopen(logPath, "a");
+	if (!log) {
+		return;
+	}
+
+	auto now = std::chrono::system_clock::now();
+	auto rawTime = std::chrono::system_clock::to_time_t(now);
+	std::tm localTime = GetLocalLogTimestamp(rawTime);
+	char timestamp[32];
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &localTime);
+
+	fprintf(log, "[%s] %s\n", timestamp, message);
+	fflush(log);
+	fclose(log);
+}
+
+static void AcceleratorLogMessageV(bool toConsole, bool debugOnly, const char *fmt, va_list ap)
 {
 	char message[1024];
-	va_list ap;
-	va_start(ap, fmt);
 	vsnprintf(message, sizeof(message), fmt, ap);
 	message[sizeof(message) - 1] = '\0';
-	va_end(ap);
+
+	if (debugOnly && !acceleratorDebugLoggingEnabled.load(std::memory_order_relaxed)) {
+		return;
+	}
+
+	if (toConsole) {
+		fprintf(stderr, "[Accelerator] %s\n", message);
+		fflush(stderr);
+	}
+
+	AcceleratorWriteLogLine(message);
+}
+
+static void AcceleratorConsoleMessageV(const char *fmt, va_list ap)
+{
+	char message[1024];
+	vsnprintf(message, sizeof(message), fmt, ap);
+	message[sizeof(message) - 1] = '\0';
 
 	fprintf(stderr, "[Accelerator] %s\n", message);
 	fflush(stderr);
+}
 
-	std::lock_guard<std::mutex> lock(acceleratorLogMutex);
-	FILE *log = fopen(logPath, "a");
-	if (log) {
-		fprintf(log, "%s\n", message);
-		fflush(log);
-		fclose(log);
-	}
+static void AcceleratorConsoleMessage(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorConsoleMessageV(fmt, ap);
+	va_end(ap);
+}
+
+static void AcceleratorConsoleWarning(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorLogMessageV(true, false, fmt, ap);
+	va_end(ap);
+}
+
+static void AcceleratorDebugLog(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	AcceleratorLogMessageV(false, true, fmt, ap);
+	va_end(ap);
 }
 
 namespace
@@ -330,32 +420,6 @@ namespace
 	{
 		size_t suffixLength = strlen(suffix);
 		return value.size() >= suffixLength && value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
-	}
-
-	std::string ToLowerCopy(const std::string &value)
-	{
-		std::string lowered(value);
-		std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
-			return static_cast<char>(std::tolower(ch));
-		});
-		return lowered;
-	}
-
-	bool IsTruthyCoreConfigValue(const char *key, bool defaultValue)
-	{
-		const char *raw = g_pSM->GetCoreConfigValue(key);
-		if (!raw || !raw[0]) {
-			return defaultValue;
-		}
-
-		std::string lowered = ToLowerCopy(raw);
-		if (lowered == "1" || lowered == "y" || lowered == "yes" || lowered == "true" || lowered == "on") {
-			return true;
-		}
-		if (lowered == "0" || lowered == "n" || lowered == "no" || lowered == "false" || lowered == "off") {
-			return false;
-		}
-		return defaultValue;
 	}
 
 	bool ShouldDeleteProcessedDump()
@@ -1199,8 +1263,6 @@ namespace
 			return;
 		}
 
-		unsigned int generated = 0;
-		unsigned int failed = 0;
 		bool hadVerboseFailure = false;
 		std::set<std::string> requestedPaths = CollectRequestingThreadModulePaths(loadedDump);
 		for (unsigned int i = 0; i < modules->module_count(); ++i) {
@@ -1219,15 +1281,12 @@ namespace
 
 			std::string storedPath;
 			std::string error;
-			if (GenerateLocalSymbolFile(module, settings, storedPath, error)) {
-				generated++;
-			} else {
+			if (!GenerateLocalSymbolFile(module, settings, storedPath, error)) {
 #if defined _WINDOWS
 				if (error == kMissingAdjacentPdb) {
 					continue;
 				}
 #endif
-				failed++;
 				hadVerboseFailure = hadVerboseFailure || !error.empty();
 			}
 		}
@@ -2998,27 +3057,12 @@ public:
 
 class UploadThread: public IThread
 {
-	FILE *log = nullptr;
 	char serverId[38] = "";
 
 	void RunThread(IThreadHandle *pHandle) {
 		const bool localMode = IsLocalMode();
-		log = fopen(logPath, "a");
-		if (!log) {
-			fprintf(stderr, "[Accelerator] Failed to open Accelerator log file: %s\n", logPath);
-			fflush(stderr);
-			return;
-		} else {
-			fprintf(log, "Upload thread started. dump path: %s\n", dumpStoragePath);
-			fflush(log);
-		}
-
-		fprintf(stderr, "[Accelerator] Upload thread started. dump path: %s%s\n", dumpStoragePath, localMode ? " (local mode)" : "");
-		fflush(stderr);
-		if (log) {
-			fprintf(log, "Mode: %s\n", localMode ? "local" : "site");
-			fflush(log);
-		}
+		AcceleratorDebugLog("Upload thread started. dump path: %s", dumpStoragePath);
+		AcceleratorDebugLog("Mode: %s", localMode ? "local" : "site");
 
 		char path[512];
 		g_pSM->Format(path, sizeof(path), "%s/server-id.txt", dumpStoragePath);
@@ -3044,12 +3088,6 @@ class UploadThread: public IThread
 		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
 		if (!dumps) {
 			AcceleratorConsoleWarning("Failed to open dump directory: %s", dumpStoragePath);
-			if (log) {
-				fprintf(log, "Failed to open dump directory: %s\n", dumpStoragePath);
-				fflush(log);
-				fclose(log);
-				log = nullptr;
-			}
 			g_accelerator.MarkAsDoneUploading();
 			return;
 		}
@@ -3079,30 +3117,17 @@ class UploadThread: public IThread
 			g_pSM->Format(path, sizeof(path), "%s/%s", dumpStoragePath, name);
 			g_pSM->Format(metapath, sizeof(metapath), "%s.txt", path);
 			pending++;
-			fprintf(stderr, "[Accelerator] Found pending crash dump: %s\n", path);
-			fflush(stderr);
-			if (log) {
-				fprintf(log, "Found pending crash dump: %s\n", path);
-				fflush(log);
-			}
+			AcceleratorDebugLog("Found pending crash dump: %s", path);
 
 			if (!libsys->PathExists(metapath)) {
 				metapath[0] = '\0';
 				AcceleratorConsoleWarning("Crash dump metadata file is missing for %s; proceeding without metadata", path);
-				if (log) {
-					fprintf(log, "Metadata file missing\n");
-					fflush(log);
-				}
+				AcceleratorDebugLog("Metadata file missing");
 			}
 
 			if (localMode) {
 				skip++;
-				fprintf(stderr, "[Accelerator] Local mode enabled. Skipping remote upload for dump: %s\n", path);
-				fflush(stderr);
-				if (log) {
-					fprintf(log, "Local mode: skipped remote upload for %s\n", path);
-					fflush(log);
-				}
+				AcceleratorDebugLog("Local mode: skipped remote upload for %s", path);
 				dumps->NextEntry();
 				continue;
 			}
@@ -3122,12 +3147,7 @@ class UploadThread: public IThread
 			switch (presubmitResponse) {
 				case kPRLocalError:
 					failed++;
-					fprintf(stderr, "[Accelerator] Failed to locally process crash dump before upload.\n");
-					fflush(stderr);
-					if (log) {
-						fprintf(log, "Failed to locally process crash dump\n");
-						fflush(log);
-					}
+					AcceleratorConsoleWarning("Failed to locally process crash dump before upload.");
 					break;
 				case kPRRemoteError:
 				case kPRUploadCrashDumpAndMetadata:
@@ -3135,33 +3155,18 @@ class UploadThread: public IThread
 					if (UploadCrashDump((presubmitResponse == kPRUploadMetadataOnly) ? nullptr : path, metapath, presubmitToken, response, sizeof(response))) {
 						count++;
 						deleteAfterProcessing = shouldDeleteProcessedDump;
-						fprintf(stderr, "[Accelerator] Uploaded crash dump: %s\n", response);
-						fflush(stderr);
-						if (log) {
-							fprintf(log, "Uploaded crash dump: %s\n", response);
-							fflush(log);
-						}
+						AcceleratorConsoleWarning("Uploaded crash dump: %s", response);
 						UploadedCrash crash{ response };
 						g_accelerator.StoreUploadedCrash(crash);
 					} else {
 						failed++;
-						fprintf(stderr, "[Accelerator] Failed to upload crash dump: %s\n", response);
-						fflush(stderr);
-						if (log) {
-							fprintf(log, "Failed to upload crash dump: %s\n", response);
-							fflush(log);
-						}
+						AcceleratorConsoleWarning("Failed to upload crash dump: %s", response);
 					}
 					break;
 				case kPRDontUpload:
 					skip++;
 					deleteAfterProcessing = shouldDeleteProcessedDump;
-					fprintf(stderr, "[Accelerator] Crash dump upload skipped by server policy.\n");
-					fflush(stderr);
-					if (log) {
-						fprintf(log, "Skipped due to server request\n");
-						fflush(log);
-					}
+					AcceleratorConsoleWarning("Crash dump upload skipped by server policy.");
 					break;
 			}
 
@@ -3176,10 +3181,6 @@ class UploadThread: public IThread
 					? "retry"
 					: "MinidumpDeleteAfterProcessing is disabled";
 				AcceleratorConsoleWarning("Keeping crash dump (%s): %s", keepReason, path);
-				if (log) {
-					fprintf(log, "Keeping crash dump (%s): %s\n", keepReason, path);
-					fflush(log);
-				}
 			}
 
 			dumps->NextEntry();
@@ -3187,33 +3188,24 @@ class UploadThread: public IThread
 
 		libsys->CloseDirectory(dumps);
 		if (pending == 0) {
-			fprintf(stderr, "[Accelerator] No pending crash dumps found.\n");
-			fflush(stderr);
-			if (log) {
-				fprintf(log, "No pending crash dumps found.\n");
-				fflush(log);
-			}
-		}
-
-		if (log) {
-			fclose(log);
-			log = nullptr;
+			AcceleratorDebugLog("No pending crash dumps found.");
 		}
 
 		g_accelerator.MarkAsDoneUploading();
-		fprintf(stderr, "[Accelerator] Upload thread finished. (%d skipped, %d uploaded, %d failed)\n", skip, count, failed);
-		fflush(stderr);
+		if (skip == 0 && count == 0 && failed == 0) {
+			AcceleratorConsoleMessage("Upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		} else {
+			AcceleratorConsoleWarning("Upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		}
 	}
 
 	void OnTerminate(IThreadHandle *pHandle, bool cancel) {
-		fprintf(stderr, "[Accelerator] Upload thread terminated. (canceled = %s)\n", (cancel ? "true" : "false"));
-		fflush(stderr);
+		AcceleratorDebugLog("Upload thread terminated. (canceled = %s)", (cancel ? "true" : "false"));
 	}
 
 #if defined _LINUX
 	bool UploadSymbolFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
-		if (log) fprintf(log, "UploadSymbolFile\n");
-		if (log) fflush(log);
+		AcceleratorDebugLog("UploadSymbolFile");
 
 		auto debugFile = module->debug_file();
 		std::string vdsoOutputPath = "";
@@ -3262,8 +3254,7 @@ class UploadThread: public IThread
 			return false;
 		}
 
-		if (log) fprintf(log, "Submitting symbols for %s\n", debugFile.c_str());
-		if (log) fflush(log);
+		AcceleratorDebugLog("Submitting symbols for %s", debugFile.c_str());
 
 		auto debugFileDir = google_breakpad::DirName(debugFile);
 		std::vector<std::string> debug_dirs{
@@ -3284,8 +3275,7 @@ class UploadThread: public IThread
 
 				// Try again without debug dirs.
 				if (!WriteSymbolFile(debugFile, debugFile, "Linux", "", {}, options, outputStream)) {
-					if (log) fprintf(log, "Failed to process symbol file\n");
-					if (log) fflush(log);
+					AcceleratorDebugLog("Failed to process symbol file");
 					return false;
 				}
 			}
@@ -3327,8 +3317,7 @@ class UploadThread: public IThread
 		if (!symbolUploaded) {
 			AcceleratorConsoleWarning("Symbol upload failed for %s via %s: %s (%d)",
 				debugFile.c_str(), RedactUrlForLog(symbolUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fprintf(log, "Symbol upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fflush(log);
+			AcceleratorDebugLog("Symbol upload failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return false;
 		}
 
@@ -3339,9 +3328,8 @@ class UploadThread: public IThread
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
-		if (log) fprintf(log, "Symbol upload complete: %s\n", response);
+		AcceleratorDebugLog("Symbol upload complete: %s", response);
 		delete[] response;
-		if (log) fflush(log);
 		return true;
 	}
 #endif
@@ -3353,8 +3341,7 @@ class UploadThread: public IThread
 			return false;
 		}
 
-		if (log) fprintf(log, "Submitting binary for %s\n", codeFile.c_str());
-		if (log) fflush(log);
+		AcceleratorDebugLog("Submitting binary for %s", codeFile.c_str());
 
 		IWebForm *form = webternet->CreateForm();
 
@@ -3387,8 +3374,7 @@ class UploadThread: public IThread
 		if (!binaryUploaded) {
 			AcceleratorConsoleWarning("Binary upload failed for %s via %s: %s (%d)",
 				codeFile.c_str(), RedactUrlForLog(binaryUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fprintf(log, "Binary upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fflush(log);
+			AcceleratorDebugLog("Binary upload failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return false;
 		}
 
@@ -3399,8 +3385,7 @@ class UploadThread: public IThread
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
-		if (log) fprintf(log, "Binary upload complete: %s\n", response);
-		if (log) fflush(log);
+		AcceleratorDebugLog("Binary upload complete: %s", response);
 		delete[] response;
 
 		return true;
@@ -3611,7 +3596,7 @@ class UploadThread: public IThread
 		if (!uploaded) {
 			AcceleratorConsoleWarning("Presubmit failed via %s: %s (%d)",
 				RedactUrlForLog(minidumpUrl).c_str(), xfer->LastErrorMessage(), xfer->LastErrorCode());
-			if (log) fprintf(log, "Presubmit failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
+			AcceleratorDebugLog("Presubmit failed: %s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return kPRRemoteError;
 		}
 
@@ -3626,14 +3611,14 @@ class UploadThread: public IThread
 
 		if (responseSize < 2) {
 			AcceleratorConsoleWarning("Presubmit failed: server response was too short from %s", RedactUrlForLog(minidumpUrl).c_str());
-			if (log) fprintf(log, "Presubmit response too short\n");
+			AcceleratorDebugLog("Presubmit response too short");
 			delete[] response;
 			return kPRRemoteError;
 		}
 
 		if (response[0] == 'E') {
 			AcceleratorConsoleWarning("Presubmit rejected by server %s: %s", RedactUrlForLog(minidumpUrl).c_str(), &response[2]);
-			if (log) fprintf(log, "Presubmit error: %s\n", &response[2]);
+			AcceleratorDebugLog("Presubmit error: %s", &response[2]);
 			delete[] response;
 			return kPRRemoteError;
 		}
@@ -3646,7 +3631,7 @@ class UploadThread: public IThread
 
 		if (response[1] != '|') {
 			AcceleratorConsoleWarning("Presubmit failed: server response delimiter missing from %s", RedactUrlForLog(minidumpUrl).c_str());
-			if (log) fprintf(log, "Response delimiter missing\n");
+			AcceleratorDebugLog("Response delimiter missing");
 			delete[] response;
 			return kPRRemoteError;
 		}
@@ -3654,7 +3639,7 @@ class UploadThread: public IThread
 		unsigned int responseCount = responseSize - 2;
 		if (responseCount < moduleCount) {
 			AcceleratorConsoleWarning("Presubmit warning: server module response was shorter than request (%u < %u)", responseCount, moduleCount);
-			if (log) fprintf(log, "Response module list doesn't match sent list (%u < %u)\n", responseCount, moduleCount);
+			AcceleratorDebugLog("Response module list doesn't match sent list (%u < %u)", responseCount, moduleCount);
 			delete[] response;
 			return presubmitResponse;
 		}
@@ -3673,7 +3658,7 @@ class UploadThread: public IThread
 				tokenBuffer[tokenLength] = '\0';
 			}
 
-			if (log) fprintf(log, "Got a presubmit token from server: %s\n", tokenBuffer);
+			AcceleratorDebugLog("Got a presubmit token from server: %s", tokenBuffer);
 		}
 
 		if (moduleCount > 0) {
@@ -3702,14 +3687,12 @@ class UploadThread: public IThread
 				if (!submitSymbols && !submitBinary) {
 					continue;
 				}
-				if (log) fprintf(log, "Getting module at index %d\n", moduleIndex);
-				if (log) fflush(log);
+				AcceleratorDebugLog("Getting module at index %d", moduleIndex);
 
 				auto module = processState.modules()->GetModuleAtIndex(moduleIndex);
 
 				auto moduleType = ClassifyModule(module);
-				if (log) fprintf(log, "Classified module %s as %s\n", module->code_file().c_str(), ModuleTypeCode[moduleType]);
-				if (log) fflush(log);
+				AcceleratorDebugLog("Classified module %s as %s", module->code_file().c_str(), ModuleTypeCode[moduleType]);
 				switch (moduleType) {
 					case kMTUnknown:
 						continue;
@@ -3742,8 +3725,7 @@ class UploadThread: public IThread
 #endif
 			}
 		}
-		if (log) fprintf(log, "PresubmitCrashDump complete\n");
-		if (log) fflush(log);
+		AcceleratorDebugLog("PresubmitCrashDump complete");
 
 		delete[] response;
 		return presubmitResponse;
@@ -3823,6 +3805,25 @@ public:
 	}
 
 } spNotifyThread;
+
+static void StartAcceleratorBackgroundThreads()
+{
+	if (acceleratorBackgroundThreadsStarted.exchange(true, std::memory_order_relaxed)) {
+		return;
+	}
+
+	const bool localMode = IsLocalMode();
+	if (!localMode) {
+		threader->MakeThread(&uploadThread);
+	} else {
+		g_accelerator.MarkAsDoneUploading();
+		StartLocalDumpWorker();
+	}
+
+	// This thread waits for Accelerator to finish uploading and for the first OnMapStart call,
+	// then fires a SourceMod forward.
+	threader->MakeThread(&spNotifyThread);
+}
 
 class VFuncEmptyClass {};
 
@@ -3913,6 +3914,7 @@ Accelerator::Accelerator() :
 
 bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 {
+	acceleratorDebugLoggingEnabled.store(IsTruthyCoreConfigValue("MinidumpDebug", false), std::memory_order_relaxed);
 	const bool localMode = IsLocalMode();
 	if (!localMode) {
 		sharesys->AddDependency(myself, "webternet.ext", true, true);
@@ -3940,7 +3942,8 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
 	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
 
-	AcceleratorConsoleWarning("Accelerator mode: %s", localMode ? "local" : "site");
+	AcceleratorConsoleMessage("Accelerator mode: %s", localMode ? "local" : "site");
+	AcceleratorDebugLog("Accelerator mode: %s", localMode ? "local" : "site");
 	if (localMode) {
 		const std::string carburetorPath = GetConfiguredCarburetorPath();
 		const std::vector<std::string> symbolPaths = GetConfiguredLocalSymbolPaths();
@@ -3953,20 +3956,12 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 		if (!EnsureDirectoryExists(GetLocalOutputRoot(), createError) && !createError.empty()) {
 			AcceleratorConsoleWarning("Failed to create local output root: %s", createError.c_str());
 		}
-		AcceleratorConsoleWarning("Local mode carburetor path: %s", carburetorPath.c_str());
-		AcceleratorConsoleWarning("Local mode symbol paths: %s", joinedSymbolPaths.c_str());
+		AcceleratorDebugLog("Local mode carburetor path: %s", carburetorPath.c_str());
+		AcceleratorDebugLog("Local mode symbol paths: %s", joinedSymbolPaths.c_str());
 		if (!PathExistsFile(carburetorPath)) {
 			AcceleratorConsoleWarning("Carburetor binary is missing. rawraw will fall back to built-in output until MinidumpLocalCarburetorPath is configured.");
 		}
 	}
-
-	if (!localMode) {
-		threader->MakeThread(&uploadThread);
-	} else {
-		MarkAsDoneUploading();
-		StartLocalDumpWorker();
-	}
-	threader->MakeThread(&spNotifyThread); // This thread waits for accelator to be done uploading and for the first OnMapStart call, then fires a SourceMod forward
 
 	do {
 		char gameconfigError[256];
@@ -4172,6 +4167,7 @@ void Accelerator::SDK_OnUnload()
 
 void Accelerator::SDK_OnAllLoaded()
 {
+	acceleratorDebugLoggingEnabled.store(IsTruthyCoreConfigValue("MinidumpDebug", false), std::memory_order_relaxed);
 	extforwards::Init();
 	sharesys->RegisterLibrary(myself, "accelerator");
 
@@ -4179,6 +4175,7 @@ void Accelerator::SDK_OnAllLoaded()
 	m_natives.push_back({ nullptr, nullptr }); // SM requires this to signal the end of the native info array
 
 	sharesys->AddNatives(myself, m_natives.data());
+	StartAcceleratorBackgroundThreads();
 }
 
 void Accelerator::OnCoreMapStart(edict_t *pEdictList, int edictCount, int clientMax)
